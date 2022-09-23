@@ -251,7 +251,7 @@ void ModeAnalysis::setup_mode_analysis()
 
         if (calc_fstate_k && (calc_fstate_omega || (print_V3 > 0) || spectral_func || calc_realpart)) {
             warn("setup_mode_analysis",
-                 "FSTATE_K = 1 shouldn't be set with the followings: PRINTV3=1, REALPART=1, FSTATE_W=1, SELF_W=1");
+                "FSTATE_K = 1 shouldn't be set with the followings: PRINTV3=1, REALPART=1, FSTATE_W=1, SELF_W=1");
         }
 
         dynamical->modify_eigenvectors();
@@ -265,6 +265,7 @@ void ModeAnalysis::run_mode_analysis()
     const auto dT = system->dT;
     double *T_arr;
 
+    // NT :: 温度の数
     unsigned int NT = static_cast<unsigned int>((Tmax - Tmin) / dT) + 1;
     allocate(T_arr, NT);
     for (unsigned int i = 0; i < NT; ++i) T_arr[i] = Tmin + static_cast<double>(i) * dT;
@@ -272,7 +273,6 @@ void ModeAnalysis::run_mode_analysis()
     const auto epsilon = integration->epsilon;
 
     if (calc_fstate_k) {
-
         // Momentum-resolved final state amplitude
         print_momentum_resolved_final_state(NT, T_arr, epsilon);
 
@@ -327,11 +327,12 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
         std::cout << " Calculate the line width (FWHM) of phonons" << std::endl;
         std::cout << " due to 3-phonon interactions for given "
                   << kslist.size() << " modes." << std::endl;
-
+	//
+	// REALPART=Trueの場合には線幅を計算
         if (calc_realpart) {
             if (anharmonic_core->quartic_mode == 1) {
                 std::cout << " REALPART = 1 and " << std::endl;
-                std::cout << " QUARTIC  = 1     : Additionally, frequency shift of phonons due to 3-phonon" << std::
+                std::cout << " QUARTIC  = 1 : Additionally, frequency shift of phonons due to 3-phonon" << std::
                 endl;
                 std::cout << "                    and 4-phonon interactions will be calculated." << std::endl;
             } else {
@@ -340,15 +341,25 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
                 std::cout << "                interactions will be calculated." << std::endl;
             }
         }
-
+	// それ以外の場合には虚部を計算する．
         if (anharmonic_core->quartic_mode == 2) {
             std::cout << std::endl;
             std::cout << " QUARTIC = 2 : Additionally, phonon line width due to 4-phonon" << std::endl;
             std::cout << "               interactions will be calculated." << std::endl;
             std::cout << " WARNING     : This is very very expensive." << std::endl;
         }
-    }
 
+	// add by me!!
+	// for complex system, we just calculate 4ph-diagram
+        if (anharmonic_core->quartic_mode == 3) {
+            std::cout << std::endl;
+            std::cout << " QUARTIC = 3 : Additionally, phonon line width due to 4-phonon" << std::endl;
+            std::cout << "               interactions (just 4ph-diagram) will be calculated." << std::endl;
+            std::cout << " WARNING     : This is very expensive." << std::endl;
+        }
+
+    }
+    
     allocate(damping_a, NT);
     allocate(self_a, NT);
     allocate(self_b, NT);
@@ -364,7 +375,12 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
         allocate(self_i, NT);
         allocate(self_j, NT);
     }
+    if (anharmonic_core->quartic_mode == 3) {
+        allocate(self_c, NT);
+    }
 
+
+    
     for (int i = 0; i < kslist.size(); ++i) {
         const auto knum = kslist[i] / ns;
         const auto snum = kslist[i] % ns;
@@ -388,6 +404,7 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
         const auto ik_irred = dos->kmesh_dos->kmap_to_irreducible[knum];
 
         if (integration->ismear == -1) {
+	  // ismear=-1の時はtetrahedronで計算
             anharmonic_core->calc_damping_tetrahedron(NT, T_arr, omega, ik_irred, snum,
                                                       dos->kmesh_dos,
                                                       dos->dymat_dos->get_eigenvalues(),
@@ -402,6 +419,7 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
             for (j = 0; j < NT; ++j) damping_a[j] = self_a[j].imag();
         }
         if (anharmonic_core->quartic_mode == 2) {
+	    // 4ph-diagram 
             selfenergy->selfenergy_c(NT, T_arr, omega, knum, snum,
                                      dos->kmesh_dos,
                                      dos->dymat_dos->get_eigenvalues(),
@@ -485,15 +503,16 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
             ofs_linewidth.close();
             std::cout << "  Phonon line-width is printed in " << file_linewidth << std::endl;
         }
-
+	
         if (calc_realpart) {
             selfenergy->selfenergy_tadpole(NT, T_arr, omega, knum, snum,
                                            dos->kmesh_dos,
                                            dos->dymat_dos->get_eigenvalues(),
                                            dos->dymat_dos->get_eigenvectors(),
                                            self_tadpole);
-            //                selfenergy->selfenergy_a(NT, T_arr, omega, knum, snum, self_a);
-
+            // selfenergy->selfenergy_a(NT, T_arr, omega, knum, snum, self_a);
+	    
+	    // if quartic_mode == 1, then calculate Loop diagram shift
             if (anharmonic_core->quartic_mode == 1) {
                 selfenergy->selfenergy_b(NT, T_arr, omega, knum, snum,
                                          dos->kmesh_dos,
@@ -526,9 +545,9 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
                     ofs_shift << std::setw(10) << T_arr[j];
                     ofs_shift << std::setw(15) << writes->in_kayser(-self_tadpole[j].real());
                     ofs_shift << std::setw(15) << writes->in_kayser(-self_a[j].real());
-
+		    //最終的な振動数(omega-delta Omega)を計算
                     auto omega_shift = omega - self_tadpole[j].real() - self_a[j].real();
-
+		    //if anharmonic_core == 1, then calculate loop-diagram.
                     if (anharmonic_core->quartic_mode == 1) {
                         ofs_shift << std::setw(15) << writes->in_kayser(-self_b[j].real());
                         omega_shift -= self_b[j].real();

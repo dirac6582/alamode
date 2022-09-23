@@ -33,13 +33,24 @@ Selfenergy::~Selfenergy()
 void Selfenergy::setup_selfenergy()
 {
     ns = dynamical->neval;
-    epsilon = integration->epsilon;
+    epsilon = integration->epsilon; // 積分時のsmearing幅
 }
+
 
 void Selfenergy::mpi_reduce_complex(unsigned int N,
                                     std::complex<double> *in_mpi,
                                     std::complex<double> *out) const
 {
+  /*
+    mpi_reduce_complex          : 
+    mpi_reduce関数は元々のくみこみ関数:
+    comm内の全プロセスのsendbufに、opで指定した演算を施して、rootプロセスのrecvbufへ送る。右の図の例では、4つのプロセスがそれぞれ1、2、3、4という値を持っていて、これに「加算」という演算が施され（1＋2＋3＋4＝10）、その結果がプロセス0へ送られている。送受信に参加する全てのプロセスがMPI_Reduceをコールする必要があり、root、comm、opなどはその全てのプロセスが同じ値を指定しなければならない。
+  */
+
+
+
+
+    
 #ifdef MPI_COMPLEX16
     MPI_Reduce(&in_mpi[0], &out[0], N, MPI_COMPLEX16, MPI_SUM, 0, MPI_COMM_WORLD);
 #else
@@ -68,6 +79,8 @@ void Selfenergy::mpi_reduce_complex(unsigned int N,
     deallocate(ret_im);
 #endif
 }
+
+
 
 void Selfenergy::selfenergy_tadpole(const unsigned int N,
                                     const double *T,
@@ -151,11 +164,22 @@ void Selfenergy::selfenergy_a(const unsigned int N,
                               std::complex<double> *ret) const
 {
     /*
-
-    Diagram (a)
+    Diagram (a):Bubble
     Matrix elements that appear : V3^2
     Computational cost          : O(N_k * N^2)
+    --------------------
+    input
 
+     const unsigned int N       : 温度の数(len(T))
+     const double *T,           : 温度の配列
+     const double omega,        : 振動数
+     const unsigned int knum,   : 
+     const unsigned int snum,
+     const KpointMeshUniform *kmesh_in, : inputから計算されるkmesh
+     const double *const *eval_in,      : harmonicの振動数リスト
+     const std::complex<double> *const *const *evec_in, : harmonicの固有ベクトル，使ってない
+     std::complex<double> *ret) const   : これを返す
+     
     */
 
     unsigned int i;
@@ -171,13 +195,13 @@ void Selfenergy::selfenergy_a(const unsigned int N,
 
     arr_cubic[0] = ns * kmesh_in->kindex_minus_xk[knum] + snum;
 
-    std::complex<double> omega_shift = omega + im * epsilon;
-
+    std::complex<double> omega_shift = omega + im * epsilon; //虚数を加える.
+    // 温度Nに関するMPI(openMPではない！)
     allocate(ret_mpi, N);
+    
+    for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0); //返す自己エネルギーを0で初期化
 
-    for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0);
-
-    for (unsigned int ik1 = mympi->my_rank; ik1 < nk; ik1 += mympi->nprocs) {
+    for (unsigned int ik1 = mympi->my_rank; ik1 < nk; ik1 += mympi->nprocs) { //
 
         xk_tmp[0] = xk[knum][0] - xk[ik1][0];
         xk_tmp[1] = xk[knum][1] - xk[ik1][1];
@@ -221,12 +245,15 @@ void Selfenergy::selfenergy_a(const unsigned int N,
 
     double factor = 1.0 / (static_cast<double>(nk) * std::pow(2.0, 4));
     for (i = 0; i < N; ++i) ret_mpi[i] *= factor;
-
+    
     mpi_reduce_complex(N, ret_mpi, ret);
 
     deallocate(ret_mpi);
 }
 
+//
+// Loop
+//
 void Selfenergy::selfenergy_b(const unsigned int N,
                               const double *T,
                               const double omega,
@@ -238,10 +265,10 @@ void Selfenergy::selfenergy_b(const unsigned int N,
                               std::complex<double> *ret) const
 {
     /*
-    Diagram (b)
+    Diagram (b) : Loop
     Matrix elements that appear : V4
     Computational cost          : O(N_k * N)
-    Note                        : This give rise to the phonon frequency-shift only.
+    Note                        : This give rise to the phonon frequency-shift only.(Loop)
     */
 
     unsigned int i;
@@ -293,6 +320,7 @@ void Selfenergy::selfenergy_b(const unsigned int N,
     deallocate(ret_mpi);
 }
 
+
 void Selfenergy::selfenergy_c(const unsigned int N,
                               const double *T,
                               const double omega,
@@ -305,9 +333,10 @@ void Selfenergy::selfenergy_c(const unsigned int N,
 {
     /*
 
-    Diagram (c)
+    Diagram (c) : 4ph
     Matrix elements that appear : V4^2
     Computational cost          : O(N_k^2 * N^3) <-- about N_k * N times that of Diagram (a)
+    Note  : 
 
     */
 
@@ -322,11 +351,12 @@ void Selfenergy::selfenergy_c(const unsigned int N,
     std::complex<double> *ret_mpi;
 
     allocate(ret_mpi, N);
-
+    // 微小な複素数を加えている
     std::complex<double> omega_shift = omega + im * epsilon;
 
-    for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0);
-
+    for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0); // MPI用? どうも温度についてのMPI化をやっている？
+    
+    // ここが謎．
     arr_quartic[0] = ns * kmesh_in->kindex_minus_xk[knum] + snum;
 
     for (unsigned int ik1 = mympi->my_rank; ik1 < nk; ik1 += mympi->nprocs) {
@@ -339,22 +369,22 @@ void Selfenergy::selfenergy_c(const unsigned int N,
             const auto ik3 = kmesh_in->get_knum(xk_tmp);
 
             for (unsigned int is1 = 0; is1 < ns; ++is1) {
-
+	        // k点一つ目 
                 arr_quartic[1] = ns * ik1 + is1;
                 double omega1 = eval_in[ik1][is1];
 
                 for (unsigned int is2 = 0; is2 < ns; ++is2) {
-
+	        // k点2つ目 
                     arr_quartic[2] = ns * ik2 + is2;
                     double omega2 = eval_in[ik2][is2];
 
                     for (unsigned int is3 = 0; is3 < ns; ++is3) {
-
+		        // k点3つ目 		      
                         arr_quartic[3] = ns * ik3 + is3;
                         double omega3 = eval_in[ik3][is3];
-
+			//Vを計算
                         double v4_tmp = std::norm(anharmonic_core->V4(arr_quartic));
-
+			//分母にくる振動数の差を計算
                         omega_sum[0]
                                 = 1.0 / (omega_shift - omega1 - omega2 - omega3)
                                   - 1.0 / (omega_shift + omega1 + omega2 + omega3);
@@ -370,7 +400,7 @@ void Selfenergy::selfenergy_c(const unsigned int N,
 
                         for (i = 0; i < N; ++i) {
                             double T_tmp = T[i];
-
+			    // BE分布関数
                             double n1 = thermodynamics->fB(omega1, T_tmp);
                             double n2 = thermodynamics->fB(omega2, T_tmp);
                             double n3 = thermodynamics->fB(omega3, T_tmp);
@@ -378,7 +408,7 @@ void Selfenergy::selfenergy_c(const unsigned int N,
                             double n12 = n1 * n2;
                             double n23 = n2 * n3;
                             double n31 = n3 * n1;
-
+			    
                             ret_mpi[i] += v4_tmp
                                           * ((n12 + n23 + n31 + n1 + n2 + n3 + 1.0) * omega_sum[0]
                                              + (n31 + n23 + n3 - n12) * omega_sum[1]
@@ -390,7 +420,7 @@ void Selfenergy::selfenergy_c(const unsigned int N,
             }
         }
     }
-
+    //ここのファクターは要注意
     double factor = -1.0 / (std::pow(static_cast<double>(nk), 2) * std::pow(2.0, 5) * 3.0);
     for (i = 0; i < N; ++i) ret_mpi[i] *= factor;
 

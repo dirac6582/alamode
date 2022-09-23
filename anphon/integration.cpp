@@ -34,6 +34,10 @@ Integration::~Integration()
 
 void Integration::set_default_variables()
 {
+  /*
+    デフォルトの積分幅は10カイザーになっている．ここを変えられるようになるとよい．
+  */
+  
     ismear = -1;
     epsilon = 10.0;
 }

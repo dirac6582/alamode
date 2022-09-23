@@ -725,6 +725,10 @@ std::complex<double> AnharmonicCore::V3_mode(int mode,
     return ctmp / std::sqrt(eval[0][mode] * eval[1][is] * eval[2][js]);
 }
 
+
+// 
+//  重要
+//
 void AnharmonicCore::calc_damping_smearing(const unsigned int ntemp,
                                            const double *temp_in,
                                            const double omega_in,
@@ -735,6 +739,7 @@ void AnharmonicCore::calc_damping_smearing(const unsigned int ntemp,
                                            const std::complex<double> *const *const *evec_in,
                                            double *ret)
 {
+  // bubble自己エネルギーの計算（Lorentian smearing）
     // This function returns the imaginary part of phonon self-energy 
     // for the given frequency omega_in.
     // Lorentzian or Gaussian smearing will be used.
@@ -841,7 +846,7 @@ void AnharmonicCore::calc_damping_smearing(const unsigned int ntemp,
                                           phase_storage_dos)) * multi;
         }
     }
-
+    // 温度に関するループ
     for (i = 0; i < ntemp; ++i) {
         T_tmp = temp_in[i];
         ret_tmp = 0.0;
@@ -901,6 +906,7 @@ void AnharmonicCore::calc_damping_tetrahedron(const unsigned int ntemp,
                                               const std::complex<double> *const *const *evec_in,
                                               double *ret)
 {
+  // 与えられた振動数におけるbubble自己エネルギー（tetrahedron）
     // This function returns the imaginary part of phonon self-energy 
     // for the given frequency omega_in.
     // Tetrahedron method will be used.
@@ -1272,6 +1278,10 @@ std::complex<double> PhaseFactorStorage::get_exp_type2(const double *phase3_in) 
     return exp_phase3[loc[0]][loc[1]][loc[2]];
 }
 
+
+
+
+// 重要
 void AnharmonicCore::calc_self3omega_tetrahedron(const double Temp,
                                                  const KpointMeshUniform *kmesh_in,
                                                  const double *const *eval_in,
@@ -1282,6 +1292,7 @@ void AnharmonicCore::calc_self3omega_tetrahedron(const double Temp,
                                                  const double *omega,
                                                  double *ret)
 {
+    // テトラへドロン法によって振動数依存の自己エネルギーを計算できる．
     // This function returns the imaginary part of phonon self-energy 
     // for the given frequency range of omega, phonon frequency (eval) and phonon eigenvectors (evec).
     // The tetrahedron method will be used.
@@ -1493,6 +1504,7 @@ void AnharmonicCore::calc_self3omega_tetrahedron(const double Temp,
     deallocate(kmap_identity);
     deallocate(kpairs);
 }
+
 
 int AnharmonicCore::get_ngroup_fcs(const unsigned int order) const
 {
