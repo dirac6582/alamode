@@ -331,12 +331,14 @@ void Input::parse_general_vars()
 void Input::parse_scph_vars()
 {
     // Read input parameters in the &scph-field.
+    //
+    // * ONLY_V4 :: add by amano :: if true, calculate only V4 array.
 
     struct stat st{};
     const std::vector<std::string> input_list{
             "KMESH_SCPH", "KMESH_INTERPOLATE", "MIXALPHA", "MAXITER",
             "RESTART_SCPH", "IALGO", "SELF_OFFDIAG", "TOL_SCPH",
-            "LOWER_TEMP", "WARMSTART", "BUBBLE"
+            "LOWER_TEMP", "WARMSTART", "BUBBLE", "ONLY_V4" 
     };
     std::vector<std::string> no_defaults{"KMESH_SCPH", "KMESH_INTERPOLATE"};
     std::vector<int> kmesh_v, kmesh_interpolate_v;
@@ -370,6 +372,7 @@ void Input::parse_scph_vars()
     auto lower_temp = true;
     auto warm_start = true;
     unsigned int bubble = 0;
+    unsigned int only_v4 = 0; // default 0 = false
 
     // if file_dymat exists in the current directory,
     // restart mode will be automatically turned on for SCPH calculations.
@@ -387,6 +390,7 @@ void Input::parse_scph_vars()
     assign_val(lower_temp, "LOWER_TEMP", scph_var_dict);
     assign_val(warm_start, "WARMSTART", scph_var_dict);
     assign_val(bubble, "BUBBLE", scph_var_dict);
+    assign_val(only_v4, "ONLY_V4", scph_var_dict); //add by amano
 
     auto str_tmp = scph_var_dict["KMESH_SCPH"];
 
@@ -450,6 +454,7 @@ void Input::parse_scph_vars()
     scph->lower_temp = lower_temp;
     scph->warmstart_scph = warm_start;
     scph->bubble = bubble;
+    scph->only_v4 = only_v4; // add by amano
 
     kmesh_v.clear();
     kmesh_interpolate_v.clear();
@@ -464,14 +469,19 @@ void Input::parse_analysis_vars(const bool use_default_values)
 
     std::vector<std::string> input_list{
             "PRINTEVEC", "PRINTXSF", "PRINTVEL", "QUARTIC", "KS_INPUT",
-            "REALPART", "ISOTOPE", "ISOFACT",
+            "REALPART", "IMAGPART", "ISOTOPE", "ISOFACT", // どうせimagpartは計算するから関係ないか．
             "FSTATE_W", "FSTATE_K", "PRINTMSD", "DOS", "PDOS", "TDOS",
             "GRUNEISEN", "NEWFCS", "DELTA_A", "ANIME", "ANIME_CELLSIZE",
             "ANIME_FORMAT", "ANIME_FRAMES", "SPS", "PRINTV3", "PRINTPR",
             "FC2_EWALD", "KAPPA_SPEC", "SELF_W", "UCORR", "SHIFT_UCORR",
             "KAPPA_COHERENT",
             "DIELEC", "SELF_ENERGY", "PRINTV4", "ZMODE", "PROJECTION_AXES",
-            "LONGITUDINAL_DOS"
+            "LONGITUDINAL_DOS",
+            "FREQ_SELF_ENERGY", // add by me
+            "FREQ_DIELEC",      // add by me 
+            "FLG_4PH",          // add by me
+            "FLG_BUBBLE",       // add by me
+
     };
 
 #ifdef _FE_BUBBLE
@@ -513,6 +523,8 @@ void Input::parse_analysis_vars(const bool use_default_values)
     auto delta_a = 0.001;
 
     auto quartic_mode = 0;
+    auto flg_bubble = 0; // add by me
+    auto flg_4ph = 0; // add by me
     auto calc_realpart = false;
     auto include_isotope = 0;
     auto fstate_omega = false;
@@ -528,6 +540,8 @@ void Input::parse_analysis_vars(const bool use_default_values)
 
     auto calculate_dielectric_constant = 0;
     auto calc_selfenergy = 0;
+    auto calc_freq_selfenergy = 0; //add by me
+    auto calc_freq_dielecfunction = 0; //add by me
     auto print_zmode = false;
 
     auto do_projection = false;
@@ -553,6 +567,8 @@ void Input::parse_analysis_vars(const bool use_default_values)
         assign_val(delta_a, "DELTA_A", analysis_var_dict);
 
         assign_val(quartic_mode, "QUARTIC", analysis_var_dict);
+        assign_val(flg_4ph, "FLG_4PH", analysis_var_dict);     //add by me        
+        assign_val(flg_bubble, "FLG_BUBBLE", analysis_var_dict);     //add by me        
         assign_val(calc_realpart, "REALPART", analysis_var_dict);
         assign_val(include_isotope, "ISOTOPE", analysis_var_dict);
         assign_val(fstate_omega, "FSTATE_W", analysis_var_dict);
@@ -562,7 +578,9 @@ void Input::parse_analysis_vars(const bool use_default_values)
         assign_val(calc_coherent, "KAPPA_COHERENT", analysis_var_dict);
         assign_val(bubble_omega, "SELF_W", analysis_var_dict);
         assign_val(calc_selfenergy, "SELF_ENERGY", analysis_var_dict);
-
+        assign_val(calc_freq_selfenergy, "FREQ_SELF_ENERGY", analysis_var_dict);     //add by me
+        assign_val(calc_freq_dielecfunction, "FREQ_DIELEC", analysis_var_dict);     //add by me
+        std::cout << "FINISH ASSIGN VAL" << std::endl; //debug
         assign_val(print_xsf, "PRINTXSF", analysis_var_dict);
         assign_val(print_V3, "PRINTV3", analysis_var_dict);
         assign_val(print_V4, "PRINTV4", analysis_var_dict);
@@ -750,6 +768,8 @@ void Input::parse_analysis_vars(const bool use_default_values)
     conductivity->calc_kappa_spec = calculate_kappa_spec;
     conductivity->calc_coherent = calc_coherent;
     anharmonic_core->quartic_mode = quartic_mode;
+    anharmonic_core->flg_bubble = flg_bubble; // add by me    
+    anharmonic_core->flg_4ph    = flg_4ph; // add by me        
     dielec->calc_dielectric_constant = calculate_dielectric_constant;
 
     mode_analysis->ks_input = ks_input;
@@ -760,6 +780,9 @@ void Input::parse_analysis_vars(const bool use_default_values)
     mode_analysis->print_V4 = print_V4;
     mode_analysis->spectral_func = bubble_omega;
     mode_analysis->calc_selfenergy = calc_selfenergy;
+    mode_analysis->calc_freq_selfenergy = calc_freq_selfenergy;
+    mode_analysis->calc_freq_dielecfunction = calc_freq_dielecfunction;
+    std::cout << "FINISH COPY VAL TO CLASSES" << std::endl;
     isotope->include_isotope = include_isotope;
 
     gruneisen->print_gruneisen = print_gruneisen;

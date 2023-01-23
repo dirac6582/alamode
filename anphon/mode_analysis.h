@@ -80,6 +80,10 @@ public:
     std::string ks_input;
     std::vector<unsigned int> kslist;
 
+    int calc_freq_selfenergy;     //add by me
+    int calc_freq_dielecfunction; //add by me
+//    int self_list; // add by me
+
 private:
     void set_default_variables();
 
@@ -145,6 +149,27 @@ private:
                    const unsigned int,
                    const std::vector<KsListGroup> &,
                    std::vector<std::vector<std::complex<double>>> &) const;
+
+    void print_dielecfunction(const unsigned int,
+                          double *); //add by me
+
+    void print_frequency_dependent_selfenergy(const unsigned int,
+                          double *); // add by me
+
+    void output_mode_information(const int, // i
+                                const int, //knum
+                                const int, //snum
+                                const double); // for output mode-info (in ks_input)
+
+    void output_selfenergy_information(const unsigned int ,
+                                                 double *,
+                                                 const unsigned int , //mode num ( depends on program)
+                                                 const unsigned int ,
+                                                 const unsigned int ,
+                                                 const unsigned int , // num of omega 
+                                                 double *,       // omega list
+                                                 std::complex<double> *,
+                                                 const std::string ) ;
 
     void print_selfenergy(const unsigned int,
                           double *);

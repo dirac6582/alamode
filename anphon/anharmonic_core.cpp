@@ -47,6 +47,8 @@ AnharmonicCore::~AnharmonicCore()
 void AnharmonicCore::set_default_variables()
 {
     quartic_mode = 0;
+    flg_4ph = 0; // add by me
+    flg_bubble = 0; // add by me
     use_tuned_ver = true;
     use_triplet_symmetry = true;
     use_quartet_symmetry = true;
@@ -279,6 +281,7 @@ std::complex<double> AnharmonicCore::V3(const unsigned int ks[3],
               this->phase_storage_dos);
 }
 
+// もとのV4の定義は？
 std::complex<double> AnharmonicCore::V4(const unsigned int ks[4])
 {
     return V4(ks,
@@ -489,6 +492,8 @@ void AnharmonicCore::calc_phi3_reciprocal(const double *xk1,
     }
 }
 
+// V4(q1,q2,q3,a4)の計算
+// 注意点としてPhi4に比べて1/sqrt(omega_1omega_2omega_3omega_4)だけ異なる．
 std::complex<double> AnharmonicCore::V4(const unsigned int ks[4],
                                         const double *const *xk_in,
                                         const double *const *eval_in,
@@ -760,7 +765,7 @@ void AnharmonicCore::calc_damping_smearing(const unsigned int ntemp,
     double omega_inner[2];
 
     double multi;
-
+    // 出力するself_energy
     for (i = 0; i < ntemp; ++i) ret[i] = 0.0;
 
     double **v3_arr;
@@ -773,6 +778,7 @@ void AnharmonicCore::calc_damping_smearing(const unsigned int ntemp,
 
     std::vector<KsListGroup> triplet;
 
+    //3つの波数kが-k+k2+k3=Gを満たすペアの生成．（デフォルトはsign=-1でこっちの符号）
     kmesh_in->get_unique_triplet_k(ik_in,
                                    symmetry->SymmList,
                                    false,
@@ -895,6 +901,7 @@ void AnharmonicCore::calc_damping_smearing(const unsigned int ntemp,
 
     for (i = 0; i < ntemp; ++i) ret[i] *= pi * std::pow(0.5, 4) / static_cast<double>(nk);
 }
+
 
 void AnharmonicCore::calc_damping_tetrahedron(const unsigned int ntemp,
                                               const double *temp_in,
@@ -1280,8 +1287,9 @@ std::complex<double> PhaseFactorStorage::get_exp_type2(const double *phase3_in) 
 
 
 
-
+//
 // 重要
+//
 void AnharmonicCore::calc_self3omega_tetrahedron(const double Temp,
                                                  const KpointMeshUniform *kmesh_in,
                                                  const double *const *eval_in,
@@ -1300,10 +1308,10 @@ void AnharmonicCore::calc_self3omega_tetrahedron(const double Temp,
     // In addition, both MPI and OpenMP parallelization are used in a hybrid way inside this function.
 
     const auto nk = kmesh_in->nk;
-    const int ns = dynamical->neval;
+    const int ns = dynamical->neval; //モードの数？
 
     int ik, ib, iomega;
-    const auto ns2 = ns * ns;
+    const auto ns2 = ns * ns; //モード数の二乗？
 
     unsigned int i;
     unsigned int is, js;
@@ -1337,7 +1345,7 @@ void AnharmonicCore::calc_self3omega_tetrahedron(const double Temp,
     const auto npair_uniq = triplet.size();
 
     if (npair_uniq != nk) {
-        exit("calc_self3omega_tetrahedron", "Something is wrong.");
+        exit("calc_self3omega_tetrahedron", "Something is wrong. npair_uniq != nk");
     }
 
     allocate(kpairs, nk, 2);

@@ -60,12 +60,13 @@ public:
 
     unsigned int kmesh_scph[3];
     unsigned int kmesh_interpolate[3];
-    unsigned int ialgo;
+    unsigned int ialgo; //IALGO(input)
     unsigned int bubble;
 
     bool restart_scph;
     bool warmstart_scph;
-    bool lower_temp;
+    bool lower_temp; // LOWER_TEMP(input)
+    bool only_v4;    // ONLY_V4(input) add by amano
     double tolerance_scph;
 
     void exec_scph();
@@ -122,6 +123,8 @@ private:
     void store_scph_dymat_to_file(const std::complex<double> *const *const *const *dymat_in);
 
     void exec_scph_main(std::complex<double> ****);
+
+    void exec_scph_only_V4(std::complex<double> ****); // add by amano
 
     void postprocess(std::complex<double> ****delta_dymat_scph,
                      std::complex<double> ****delta_dymat_scph_plus_bubble);

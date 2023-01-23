@@ -134,6 +134,9 @@ private:
 inline double delta_lorentz(const double omega,
                             const double epsilon)
 {
+    /*
+    ここで1/piをかけて規格化している．
+    */
     return inverse_pi * epsilon / (omega * omega + epsilon * epsilon);
 }
 

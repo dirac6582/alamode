@@ -25,6 +25,7 @@ or http://opensource.org/licenses/mit-license.php for information.
 #include "thermodynamics.h"
 #include "phonon_velocity.h"
 #include "anharmonic_core.h"
+#include "mode_analysis.h"
 #include "symmetry_core.h"
 #include "system.h"
 #include "write_phonons.h"
@@ -206,9 +207,15 @@ void Writes::write_input_vars()
 
         std::cout << "  KAPPA_SPEC = " << conductivity->calc_kappa_spec << std::endl;
 
-        //        std::cout << "  KS_INPUT = " << anharmonic_core->ks_input << std::endl;
-        //        std::cout << "  QUARTIC = " << anharmonic_core->quartic_mode << std::endl;
-        // std::cout << "  REALPART = " << anharmonic_core->calc_realpart << std::endl;
+        std::cout << "  KS_INPUT = " << mode_analysis->ks_input << std::endl;
+
+    	std::cout << "  QUARTIC          = " << anharmonic_core->quartic_mode << std::endl;
+    	std::cout << "  REALPART         = " << mode_analysis->calc_realpart << std::endl;
+    	std::cout << "  SELF_ENERGY      = " << mode_analysis->calc_selfenergy << std::endl;
+    	std::cout << "  FREQ_SELF_ENERGY = " << mode_analysis->calc_freq_selfenergy << std::endl;
+    	std::cout << "  FREQ_DIELEC      = " << mode_analysis->calc_freq_dielecfunction << std::endl;
+    	std::cout << "  FLG_BUBBLE       = " << anharmonic_core->flg_bubble << std::endl;
+    	std::cout << "  FLG_4PH          = " << anharmonic_core->flg_4ph    << std::endl;
         // std::cout << "  ATOMPROJ = " << anharmonic_core->atom_project_mode << std::endl;
         // std::cout << "  FSTATE_W = " << anharmonic_core->calc_fstate_omega << std::endl;
         //  std::cout << "  FSTATE_K = " << anharmonic_core->calc_fstate_k << std::endl;
@@ -1258,7 +1265,7 @@ void Writes::write_eigenvectors_each(const std::string &fname_evec,
     const auto neval = dynamical->neval;
     std::ofstream ofs_evec;
 
-    ofs_evec.open(fname_evec.c_str(), std::ios::out);
+    ofs_evec.open(fname_evec.c_str(), std::ios::out); //.evecファイルへ固有ベクトルを書き出す
     if (!ofs_evec) exit("write_eigenvectors", "cannot open file_evec");
     ofs_evec.setf(std::ios::scientific);
 
@@ -1611,6 +1618,9 @@ void Writes::write_eigenvectors_each_HDF5(const std::string &fname_evec,
 
 double Writes::in_kayser(const double x) const
 {
+  /*
+    Rydbergからkayserへの変換定数
+   */
     return x * Ry_to_kayser;
 }
 

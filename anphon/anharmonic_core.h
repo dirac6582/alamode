@@ -117,6 +117,8 @@ public:
                                   double *ret);
 
     int quartic_mode;
+    int flg_4ph; // add by me
+    int flg_bubble; // add by me
     bool use_tuned_ver;
     bool use_triplet_symmetry;
     bool use_quartet_symmetry;

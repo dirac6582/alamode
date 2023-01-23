@@ -7,7 +7,7 @@
  Please see the file 'LICENCE.txt' in the root directory 
  or http://opensource.org/licenses/mit-license.php for information.
 */
-
+#include <iomanip>
 #include "mpi_common.h"
 #include "selfenergy.h"
 #include "constants.h"
@@ -37,7 +37,7 @@ void Selfenergy::setup_selfenergy()
 }
 
 
-void Selfenergy::mpi_reduce_complex(unsigned int N,
+void Selfenergy::mpi_reduce_complex(unsigned int N, 
                                     std::complex<double> *in_mpi,
                                     std::complex<double> *out) const
 {
@@ -45,11 +45,12 @@ void Selfenergy::mpi_reduce_complex(unsigned int N,
     mpi_reduce_complex          : 
     mpi_reduce関数は元々のくみこみ関数:
     comm内の全プロセスのsendbufに、opで指定した演算を施して、rootプロセスのrecvbufへ送る。右の図の例では、4つのプロセスがそれぞれ1、2、3、4という値を持っていて、これに「加算」という演算が施され（1＋2＋3＋4＝10）、その結果がプロセス0へ送られている。送受信に参加する全てのプロセスがMPI_Reduceをコールする必要があり、root、comm、opなどはその全てのプロセスが同じ値を指定しなければならない。
+    input ::
+    ----------
+      N :: 配列の要素数
+      in_mpi :: input配列（要素数N）
+      out :: output配列
   */
-
-
-
-
     
 #ifdef MPI_COMPLEX16
     MPI_Reduce(&in_mpi[0], &out[0], N, MPI_COMPLEX16, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -181,7 +182,6 @@ void Selfenergy::selfenergy_a(const unsigned int N,
      std::complex<double> *ret) const   : これを返す
      
     */
-
     unsigned int i;
     unsigned int arr_cubic[3];
     double xk_tmp[3];
@@ -196,6 +196,9 @@ void Selfenergy::selfenergy_a(const unsigned int N,
     arr_cubic[0] = ns * kmesh_in->kindex_minus_xk[knum] + snum;
 
     std::complex<double> omega_shift = omega + im * epsilon; //虚数を加える.
+        if (mympi->my_rank == 0) {
+        std::cout << " (bubble) alamodeの振動数は "  << std::setprecision(16) << omega << std::endl;
+        }
     // 温度Nに関するMPI(openMPではない！)
     allocate(ret_mpi, N);
     
@@ -251,6 +254,301 @@ void Selfenergy::selfenergy_a(const unsigned int N,
     deallocate(ret_mpi);
 }
 
+void Selfenergy::selfenergy_a_amano(const unsigned int N, //温度Tの数．まずこれが1じゃなかったらerrorを返すようにする．
+                              const double *T, //温度Tの配列
+                              const unsigned int knum,
+                              const unsigned int snum, //モード番号（0始まり）
+                              const KpointMeshUniform *kmesh_in,
+                              const double *const *eval_in, //固有値
+                              const std::complex<double> *const *const *evec_in, //フォノン固有ベクトル
+                              const unsigned int nomega, // num of omega 
+                              const double *omega,       // omega list
+                              std::complex<double> *ret) const
+{
+    /*
+    Diagram (a):Bubble
+    Matrix elements that appear : V3^2
+    Computational cost          : O(N_k * N^2)
+    --------------------
+    input
+
+     const unsigned int N       : 温度の数(len(T))
+     const double *T,           : 温度の配列
+     const double omega,        : 振動数
+     const unsigned int knum,   : 
+     const unsigned int snum,
+     const KpointMeshUniform *kmesh_in, : inputから計算されるkmesh
+     const double *const *eval_in,      : harmonicの振動数リスト
+     const std::complex<double> *const *const *evec_in, : harmonicの固有ベクトル，使ってない
+     std::complex<double> *ret) const   : これを返す
+     
+    */
+    unsigned int i; // for iteration
+    unsigned int arr_cubic[3];
+    double xk_tmp[3];
+    std::complex<double> omega_sum[2];
+    // ---------------    
+    std::complex<double> *ret_mpi; // answer self-energy (original)
+    // 温度Nに関するMPI(openMPではない！)
+    allocate(ret_mpi, N);
+    
+    for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0); //initialize self-energy to 0
+    // ---------------    
+
+    // ここから自分のコード //
+    std::complex<double> *myomega;   //オメガ配列用 (add im*epsilon)
+    std::complex<double> *ret_mpi3; //結果を格納する用2 (alamodeの振動数用)
+    allocate(myomega,  nomega);
+    allocate(ret_mpi3, nomega);
+
+    for (i = 0; i < nomega; ++i) ret_mpi3[i] = std::complex<double>(0.0, 0.0); //self energy initialize
+    for (i = 0; i < nomega; ++i) myomega[i] = omega[i]+ im * epsilon; // add infinitesimal(epsilon) imaginary part
+
+#ifdef _DEBUG //デバック用に計算するomegaメッシュの振動数を出力する．
+    if (mympi->my_rank == 0) {
+            for (i = 0; i < nomega; ++i) {
+                std::cout << "alamodeで定義された振動数は" << std::setprecision(16) << omega[i] << std::endl;
+            }
+        std::cout << "計算する温度(K) は " << std::setprecision(16) << T[0] << std::endl;
+    }
+#endif
+
+    const auto nk = kmesh_in->nk;
+    const auto xk = kmesh_in->xk;
+    double n1, n2; // for BE function 
+    double f1, f2; // for sum/difference of n
+
+    arr_cubic[0] = ns * kmesh_in->kindex_minus_xk[knum] + snum; //phononのq点(nsは多分mpiに関連している．)
+
+    // std::complex<double> omega_shift = omega + im * epsilon; //虚数を加える.
+    //    if (mympi->my_rank == 0) {
+    //    std::cout << " (bubble) alamodeの振動数は "  << std::setprecision(16) << omega << std::endl;
+    //    }
+
+    for (unsigned int ik1 = mympi->my_rank; ik1 < nk; ik1 += mympi->nprocs) { //
+        xk_tmp[0] = xk[knum][0] - xk[ik1][0];
+        xk_tmp[1] = xk[knum][1] - xk[ik1][1];
+        xk_tmp[2] = xk[knum][2] - xk[ik1][2];
+
+        const auto ik2 = kmesh_in->get_knum(xk_tmp);
+
+        for (unsigned int is1 = 0; is1 < ns; ++is1) {
+            // k点1つめ
+            arr_cubic[1] = ns * ik1 + is1;
+            double omega1 = eval_in[ik1][is1];
+
+            for (unsigned int is2 = 0; is2 < ns; ++is2) {
+                // k点2つめ
+                arr_cubic[2] = ns * ik2 + is2;
+                double omega2 = eval_in[ik2][is2];
+                // V(q,q1,q2)を取得
+                double v3_tmp = std::norm(anharmonic_core->V3(arr_cubic));
+
+                for (unsigned int iomega = 0; iomega < nomega; ++iomega){
+                    //振動数オメガに関する繰り返し
+                    //分母にくる振動数の差を計算
+                    omega_sum[0] = 1.0 / (myomega[iomega] + omega1 + omega2) - 1.0 / (myomega[iomega] - omega1 - omega2);
+                    omega_sum[1] = 1.0 / (myomega[iomega] + omega1 - omega2) - 1.0 / (myomega[iomega] - omega1 + omega2);
+
+                    double T_tmp = T[0]; //とりあえず温度は1つだけ
+                    if (thermodynamics->classical) {
+                        n1 = thermodynamics->fC(omega1, T_tmp);
+                        n2 = thermodynamics->fC(omega2, T_tmp);
+                        f1 = n1 + n2;
+                        f2 = n2 - n1;
+                    } else {
+                        n1 = thermodynamics->fB(omega1, T_tmp);
+                        n2 = thermodynamics->fB(omega2, T_tmp);
+                        f1 = n1 + n2 + 1.0;
+                        f2 = n2 - n1;
+                    }
+                    ret_mpi3[iomega] += v3_tmp * (f1 * omega_sum[0] + f2 * omega_sum[1]);
+                }
+            }
+        }
+    }
+    //最後に係数をかける
+    double factor = 1.0 / (static_cast<double>(nk) * std::pow(2.0, 4));
+    for (unsigned int iomega = 0; iomega < nomega; ++iomega ) ret_mpi3[iomega] *= factor;
+
+    mpi_reduce_complex(nomega, ret_mpi3, ret); // ret_mpi3 to ret(answer)
+
+    deallocate(ret_mpi);
+    deallocate(ret_mpi3);
+}
+
+// void Selfenergy::selfenergy_a_amano(const unsigned int ntemp,
+//                                            const double *temp_in,
+//                                            const double omega_in,
+//                                            const unsigned int ik_in,
+//                                            const unsigned int is_in,
+//                                            const KpointMeshUniform *kmesh_in,
+//                                            const double *const *eval_in,
+//                                            const std::complex<double> *const *const *evec_in,
+//                                            double *ret)
+// {
+//   // bubble自己エネルギーの計算（Lorentian smearing）
+//     // This function returns the imaginary part of phonon self-energy 
+//     // for the given frequency omega_in.
+//     // Lorentzian or Gaussian smearing will be used.
+//     // This version employs the crystal symmetry to reduce the computational cost
+
+//     const auto nk = kmesh_in->nk;
+//     const auto ns = dynamical->neval;
+//     const auto ns2 = ns * ns;
+//     unsigned int i;
+//     int ik;
+//     unsigned int is, js;
+//     unsigned int arr[3];
+
+//     int k1, k2;
+
+//     double T_tmp;
+//     double n1, n2;
+//     double omega_inner[2];
+
+//     double multi;
+//     // 出力するself_energy
+//     for (i = 0; i < ntemp; ++i) ret[i] = 0.0;
+
+//     double **v3_arr;
+//     double ***delta_arr;
+//     double ret_tmp;
+
+//     double f1, f2;
+
+//     const auto epsilon = integration->epsilon;
+
+//     std::vector<KsListGroup> triplet;
+
+//     //3つの波数kが-k+k2+k3=Gを満たすペアの生成．（デフォルトはsign=-1でこっちの符号）
+//     kmesh_in->get_unique_triplet_k(ik_in,
+//                                    symmetry->SymmList,
+//                                    false,
+//                                    false,
+//                                    triplet);
+
+//     const auto npair_uniq = triplet.size();
+
+//     allocate(v3_arr, npair_uniq, ns * ns);
+//     allocate(delta_arr, npair_uniq, ns * ns, 2);
+
+//     const auto knum = kmesh_in->kpoint_irred_all[ik_in][0].knum;
+//     const auto knum_minus = kmesh_in->kindex_minus_xk[knum];
+// #ifdef _OPENMP
+// #pragma omp parallel for private(multi, arr, k1, k2, is, js, omega_inner)
+// #endif
+//     for (ik = 0; ik < npair_uniq; ++ik) {
+//         multi = static_cast<double>(triplet[ik].group.size());
+
+//         arr[0] = ns * knum_minus + is_in;
+
+//         k1 = triplet[ik].group[0].ks[0];
+//         k2 = triplet[ik].group[0].ks[1];
+
+//         for (is = 0; is < ns; ++is) {
+//             arr[1] = ns * k1 + is;
+//             omega_inner[0] = eval_in[k1][is];
+
+//             for (js = 0; js < ns; ++js) {
+//                 arr[2] = ns * k2 + js;
+//                 omega_inner[1] = eval_in[k2][js];
+
+//                 if (integration->ismear == 0) {
+//                     delta_arr[ik][ns * is + js][0]
+//                             = delta_lorentz(omega_in - omega_inner[0] - omega_inner[1], epsilon)
+//                               - delta_lorentz(omega_in + omega_inner[0] + omega_inner[1], epsilon);
+//                     delta_arr[ik][ns * is + js][1]
+//                             = delta_lorentz(omega_in - omega_inner[0] + omega_inner[1], epsilon)
+//                               - delta_lorentz(omega_in + omega_inner[0] - omega_inner[1], epsilon);
+//                 } else if (integration->ismear == 1) {
+//                     delta_arr[ik][ns * is + js][0]
+//                             = delta_gauss(omega_in - omega_inner[0] - omega_inner[1], epsilon)
+//                               - delta_gauss(omega_in + omega_inner[0] + omega_inner[1], epsilon);
+//                     delta_arr[ik][ns * is + js][1]
+//                             = delta_gauss(omega_in - omega_inner[0] + omega_inner[1], epsilon)
+//                               - delta_gauss(omega_in + omega_inner[0] - omega_inner[1], epsilon);
+//                 }
+//             }
+//         }
+//     }
+
+//     for (ik = 0; ik < npair_uniq; ++ik) {
+
+//         k1 = triplet[ik].group[0].ks[0];
+//         k2 = triplet[ik].group[0].ks[1];
+
+//         multi = static_cast<double>(triplet[ik].group.size());
+
+//         for (int ib = 0; ib < ns2; ++ib) {
+//             is = ib / ns;
+//             js = ib % ns;
+
+//             arr[0] = ns * knum_minus + is_in;
+//             arr[1] = ns * k1 + is;
+//             arr[2] = ns * k2 + js;
+
+//             v3_arr[ik][ib] = std::norm(anharmonic_core->V3(arr,
+//                                           kmesh_in->xk,
+//                                           eval_in,
+//                                           evec_in,
+//                                           anharmonic_core->phase_storage_dos)) * multi;
+//         }
+//     }
+//     // 温度に関するループ
+//     for (i = 0; i < ntemp; ++i) {
+//         T_tmp = temp_in[i];
+//         ret_tmp = 0.0;
+// #ifdef _OPENMP
+// #pragma omp parallel for private(k1, k2, is, js, omega_inner, n1, n2, f1, f2), reduction(+:ret_tmp)
+// #endif
+//         for (ik = 0; ik < npair_uniq; ++ik) {
+
+//             k1 = triplet[ik].group[0].ks[0];
+//             k2 = triplet[ik].group[0].ks[1];
+
+//             for (is = 0; is < ns; ++is) {
+
+//                 omega_inner[0] = eval_in[k1][is];
+
+//                 for (js = 0; js < ns; ++js) {
+
+//                     omega_inner[1] = eval_in[k2][js];
+
+//                     if (thermodynamics->classical) {
+//                         f1 = thermodynamics->fC(omega_inner[0], T_tmp);
+//                         f2 = thermodynamics->fC(omega_inner[1], T_tmp);
+
+//                         n1 = f1 + f2;
+//                         n2 = f1 - f2;
+//                     } else {
+//                         f1 = thermodynamics->fB(omega_inner[0], T_tmp);
+//                         f2 = thermodynamics->fB(omega_inner[1], T_tmp);
+
+//                         n1 = f1 + f2 + 1.0;
+//                         n2 = f1 - f2;
+//                     }
+
+//                     ret_tmp += v3_arr[ik][ns * is + js]
+//                                * (n1 * delta_arr[ik][ns * is + js][0]
+//                                   - n2 * delta_arr[ik][ns * is + js][1]);
+//                 }
+//             }
+//         }
+//         ret[i] = ret_tmp;
+//     }
+
+//     deallocate(v3_arr);
+//     deallocate(delta_arr);
+//     triplet.clear();
+
+//     for (i = 0; i < ntemp; ++i) ret[i] *= pi * std::pow(0.5, 4) / static_cast<double>(nk);
+// }
+
+
+
+
+
 //
 // Loop
 //
@@ -269,6 +567,16 @@ void Selfenergy::selfenergy_b(const unsigned int N,
     Matrix elements that appear : V4
     Computational cost          : O(N_k * N)
     Note                        : This give rise to the phonon frequency-shift only.(Loop)
+    const unsigned int N       : 温度の数(len(T))
+    const double *T,           : 温度の配列
+    const double omega,        : 振動数
+    const unsigned int knum,   : k点の指定のため？
+    const unsigned int snum,   : k点の指定のため？
+    const KpointMeshUniform *kmesh_in, : inputから計算されるkmesh
+    const double *const *eval_in,      : harmonicの振動数リスト
+    const std::complex<double> *const *const *evec_in, : harmonicの固有ベクトル，使ってない
+    std::complex<double> *ret) const   : これを返す
+     
     */
 
     unsigned int i;
@@ -351,12 +659,15 @@ void Selfenergy::selfenergy_c(const unsigned int N,
     std::complex<double> *ret_mpi;
 
     allocate(ret_mpi, N);
+    if (mympi->my_rank == 0) {
+        std::cout << "(4ph) Frequency " << std::setprecision(16) << omega << std::endl;
+    }
     // 微小な複素数を加えている
     std::complex<double> omega_shift = omega + im * epsilon;
 
     for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0); // MPI用? どうも温度についてのMPI化をやっている？
     
-    // ここが謎．
+    // snumはモード数．
     arr_quartic[0] = ns * kmesh_in->kindex_minus_xk[knum] + snum;
 
     for (unsigned int ik1 = mympi->my_rank; ik1 < nk; ik1 += mympi->nprocs) {
@@ -428,6 +739,147 @@ void Selfenergy::selfenergy_c(const unsigned int N,
 
     deallocate(ret_mpi);
 }
+
+//
+// 温度依存じゃなくて振動数依存にしたい．
+//
+void Selfenergy::selfenergy_c_amano(const unsigned int N, //温度Tの数．まずこれが1じゃなかったらerrorを返すようにする．
+                              const double *T, //温度Tの配列
+                              const unsigned int knum,
+                              const unsigned int snum, //モード番号（0始まり）
+                              const KpointMeshUniform *kmesh_in,
+                              const double *const *eval_in, //固有値
+                              const std::complex<double> *const *const *evec_in, //フォノン固有ベクトル
+                              const unsigned int nomega,
+                              const double *omega,
+                              std::complex<double> *ret) const
+{
+    /*
+
+    Diagram (c) : 4ph
+    Matrix elements that appear : V4^2
+    Computational cost          : O(N_k^2 * N^3) <-- about N_k * N times that of Diagram (a)
+    Note  : こちらでは温度ではないMPI並列を目指す．
+
+    */
+    unsigned int i;
+    unsigned int arr_quartic[4];
+
+    const auto nk = kmesh_in->nk;
+    const auto xk = kmesh_in->xk;
+    double xk_tmp[3];
+    std::complex<double> omega_sum[4];
+    std::complex<double> *ret_mpi; // answer self-energy 
+    allocate(ret_mpi, N);
+    // フォノン振動数omegaに微小な複素数を加えている
+    // std::complex<double> omega_shift = omega + im * epsilon;
+
+#ifdef _DEBUG //デバック用に計算するomegaメッシュの振動数を出力する．
+    if (mympi->my_rank == 0) {
+            for (i = 0; i < nomega; ++i) {
+                std::cout << "alamodeで定義された振動数は" << std::setprecision(16) << omega[i] << std::endl;
+            }
+        std::cout << "計算する温度(K) は " << std::setprecision(16) << T[0] << std::endl;
+    }
+#endif
+
+    if (N != 1 ){
+        if (mympi->my_rank == 0) {
+        std::cout << "ERROR:: Nが1ではありません" << std::endl;
+        }
+        exit(1);
+    }
+
+    // ここから自分のコード //
+    std::complex<double> *myomega;   //オメガ配列用 (add im*epsilon)
+    std::complex<double> *ret_mpi3; //結果を格納する用2 (alamodeの振動数用)
+    allocate(myomega,  nomega);
+    allocate(ret_mpi3, nomega);
+
+    for (i = 0; i < nomega; ++i) ret_mpi3[i] = std::complex<double>(0.0, 0.0); //初期化
+    for (i = 0; i < nomega; ++i) myomega[i] = omega[i]+ im * epsilon; // 微小なepsilonをたしたもの．
+
+
+    for (i = 0; i < N; ++i) ret_mpi[i] = std::complex<double>(0.0, 0.0); // MPI用? どうも温度についてのMPI化をやっている？
+    
+    // arr_quarticの1つ目ということで，V(q1,q2,q3,q4)のうちの始めのωに対応するq点を出している？
+    // 振動数依存になってもここは変更しなくて良いかも？（まずは変更せずに試す）
+    arr_quartic[0] = ns * kmesh_in->kindex_minus_xk[knum] + snum;
+
+    for (unsigned int ik1 = mympi->my_rank; ik1 < nk; ik1 += mympi->nprocs) {
+        for (unsigned int ik2 = 0; ik2 < nk; ++ik2) {
+
+            xk_tmp[0] = xk[knum][0] - xk[ik1][0] - xk[ik2][0];
+            xk_tmp[1] = xk[knum][1] - xk[ik1][1] - xk[ik2][1];
+            xk_tmp[2] = xk[knum][2] - xk[ik1][2] - xk[ik2][2];
+
+            const auto ik3 = kmesh_in->get_knum(xk_tmp);
+
+            for (unsigned int is1 = 0; is1 < ns; ++is1) {
+    	        // k点一つ目 
+                arr_quartic[1] = ns * ik1 + is1;
+                double omega1 = eval_in[ik1][is1];
+
+                for (unsigned int is2 = 0; is2 < ns; ++is2) {
+        	        // k点2つ目 
+                    arr_quartic[2] = ns * ik2 + is2;
+                    double omega2 = eval_in[ik2][is2];
+
+                    for (unsigned int is3 = 0; is3 < ns; ++is3) {
+                        // k点3つ目 		      
+                        arr_quartic[3] = ns * ik3 + is3;
+                        double omega3 = eval_in[ik3][is3];
+                        //V(q1,q2,q3,q4)を取得
+                        double v4_tmp = std::norm(anharmonic_core->V4(arr_quartic));
+                        for (unsigned int iomega = 0; iomega < nomega; ++iomega){
+                            //分母にくる振動数の差を計算
+                            omega_sum[0]
+                                    = 1.0 / (myomega[iomega]  - omega1 - omega2 - omega3)
+                                      - 1.0 / (myomega[iomega] + omega1 + omega2 + omega3);
+                            omega_sum[1]
+                                    = 1.0 / (myomega[iomega] - omega1 - omega2 + omega3)
+                                      - 1.0 / (myomega[iomega] + omega1 + omega2 - omega3);
+                            omega_sum[2]
+                                    = 1.0 / (myomega[iomega] + omega1 - omega2 - omega3)
+                                      - 1.0 / (myomega[iomega] - omega1 + omega2 + omega3);
+                            omega_sum[3]
+                                    = 1.0 / (myomega[iomega] - omega1 + omega2 - omega3)
+                                      - 1.0 / (myomega[iomega] + omega1 - omega2 + omega3);
+                            double T_tmp = T[0]; // 温度をT[0]のみに固定
+                		    // BE分布関数
+                            double n1 = thermodynamics->fB(omega1, T_tmp);
+                            double n2 = thermodynamics->fB(omega2, T_tmp);
+                            double n3 = thermodynamics->fB(omega3, T_tmp);
+
+                            double n12 = n1 * n2;
+                            double n23 = n2 * n3;
+                            double n31 = n3 * n1;
+    
+                            ret_mpi3[iomega] += v4_tmp
+                                        * ((n12 + n23 + n31 + n1 + n2 + n3 + 1.0) * omega_sum[0]
+                                        + (n31 + n23 + n3 - n12) * omega_sum[1]
+                                        + (n12 + n31 + n1 - n23) * omega_sum[2]
+                                        + (n23 + n12 + n2 - n31) * omega_sum[3]);
+                        }
+                    }          
+                }
+            }
+        }
+    }
+    //ここのファクターは要注意
+    double factor = -1.0 / (std::pow(static_cast<double>(nk), 2) * std::pow(2.0, 5) * 3.0);
+    for (unsigned int iomega = 0; iomega < nomega; ++iomega ) ret_mpi3[iomega] *= factor;
+
+    mpi_reduce_complex(nomega, ret_mpi3, ret);
+
+
+    deallocate(ret_mpi);
+    deallocate(ret_mpi3);
+
+
+}
+
+
 
 void Selfenergy::selfenergy_d(const unsigned int N,
                               const double *T,

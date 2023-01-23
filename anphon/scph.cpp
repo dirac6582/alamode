@@ -61,7 +61,7 @@ void Scph::set_default_variables()
 {
     restart_scph = false;
     warmstart_scph = false;
-    lower_temp = true;
+    lower_temp = true; // LOWER_TEMP (if true, The SCPH iteration start from TMIN to TMAX. (Raise the temperature))
     tolerance_scph = 1.0e-10;
     mixalpha = 0.1;
     maxiter = 100;
@@ -160,6 +160,15 @@ void Scph::exec_scph()
         // Read anharmonic correction to the dynamical matrix from the existing file
         load_scph_dymat_from_file(delta_dymat_scph);
 
+    } else if (only_v4) {
+        if (dynamical->nonanalytic == 3) {
+            exit("exec_scph",
+                 "Sorry, NONANALYTIC=3 can't be used for the main loop of the SCPH calculation.");
+        }
+
+        // Only calculate V4 array. mostly for debugging
+        exec_scph_only_V4(delta_dymat_scph);
+
     } else {
 
         if (dynamical->nonanalytic == 3) {
@@ -175,28 +184,29 @@ void Scph::exec_scph()
         }
     }
 
-    if (kpoint->kpoint_mode == 2) {
-        if (thermodynamics->calc_FE_bubble) {
-            compute_free_energy_bubble_SCPH(kmesh_interpolate,
-                                            delta_dymat_scph);
+    if (!only_v4){ //only_v4のときは全ての後処理をスキップ
+        if (kpoint->kpoint_mode == 2) {
+            if (thermodynamics->calc_FE_bubble) {
+                compute_free_energy_bubble_SCPH(kmesh_interpolate,
+                                                delta_dymat_scph);
+            }
         }
-    }
 
-    if (bubble) {
-        allocate(delta_dymat_scph_plus_bubble, NT, ns, ns, kmesh_coarse->nk);
-        bubble_correction(delta_dymat_scph,
-                          delta_dymat_scph_plus_bubble);
-        if (mympi->my_rank == 0) {
-            write_anharmonic_correction_fc2(delta_dymat_scph_plus_bubble, NT, bubble);
+        if (bubble) {
+            allocate(delta_dymat_scph_plus_bubble, NT, ns, ns, kmesh_coarse->nk);
+            bubble_correction(delta_dymat_scph,
+                              delta_dymat_scph_plus_bubble);
+            if (mympi->my_rank == 0) {
+                write_anharmonic_correction_fc2(delta_dymat_scph_plus_bubble, NT, bubble);
+            }
         }
+
+        postprocess(delta_dymat_scph,
+                    delta_dymat_scph_plus_bubble);
     }
-
-    postprocess(delta_dymat_scph,
-                delta_dymat_scph_plus_bubble);
-
     deallocate(delta_dymat_scph);
     if (delta_dymat_scph_plus_bubble) deallocate(delta_dymat_scph_plus_bubble);
-
+    
 }
 
 void Scph::postprocess(std::complex<double> ****delta_dymat_scph,
@@ -779,7 +789,7 @@ void Scph::exec_scph_main(std::complex<double> ****dymat_anharm)
     allocate(omega2_anharm, NT, nk, ns);
     allocate(evec_anharm_tmp, nk, ns, ns);
     allocate(v4_array_all, nk_irred_interpolate * nk,
-             ns * ns, ns * ns);
+             ns * ns, ns * ns); //割り当ての形はv4_arrayと同じに見える．最初がQ点，その後のns2,ns2がそれぞれブランチインデックス2つづつを表す．
 
     // Calculate v4 array.
     // This operation is the most expensive part of the calculation.
@@ -847,7 +857,10 @@ void Scph::exec_scph_main(std::complex<double> ****dymat_anharm)
                     }
                 }
             }
-
+            /*
+            非調和フォノンの振動数を計算するメインのアルゴリズム．
+            SCPH方程式をiterativeに解いている．
+            */ 
             compute_anharmonic_frequency(v4_array_all,
                                          omega2_anharm[iT],
                                          evec_anharm_tmp,
@@ -874,6 +887,62 @@ void Scph::exec_scph_main(std::complex<double> ****dymat_anharm)
     deallocate(v4_array_all);
     deallocate(evec_anharm_tmp);
 }
+
+
+void Scph::exec_scph_only_V4(std::complex<double> ****dymat_anharm)
+{
+    // add by amano
+    // V4だけ計算してそれを出力する．大庭さんの論文のようなことにトライする．
+    //
+
+    int ik, is;
+    const auto nk = kmesh_dense->nk;  // denseなKメッシュの数
+    const auto ns = dynamical->neval; // フォノンモードの数？（3*N）
+    const auto nk_irred_interpolate = kmesh_coarse->nk_irred;
+    const auto Tmin = system->Tmin; //多分温度はT=0とするのが正解だろう．
+    const auto Tmax = system->Tmax;
+    const auto dT = system->dT;
+    std::complex<double> ***v4_array_all;
+
+    std::vector<double> vec_temp;
+
+    const auto NT = static_cast<unsigned int>((Tmax - Tmin) / dT) + 1;
+
+    if (mympi->my_rank == 0) { 
+        std::cout << " --------------------------- \n" ;        
+        std::cout << " SCPH ONLY V4 CALCULATION... \n" ;
+        std::cout << "  only calculate V4 array and exit. \n";
+        std::cout << "\n";
+    }
+
+    // Compute matrix element of 4-phonon interaction
+
+    allocate(v4_array_all, nk_irred_interpolate * nk,
+             ns * ns, ns * ns);
+
+    // Calculate v4 array.
+    // This operation is the most expensive part of the calculation.
+    if (selfenergy_offdiagonal & (ialgo == 1)) {
+        compute_V4_elements_mpi_over_band(v4_array_all,
+                                          evec_harmonic,
+                                          selfenergy_offdiagonal);
+    } else {
+        compute_V4_elements_mpi_over_kpoint(v4_array_all,
+                                            evec_harmonic,
+                                            selfenergy_offdiagonal,
+                                            relax_coordinate);
+    }
+
+    if (mympi->my_rank == 0) { 
+        std::cout << " --------------------------- \n" ;        
+        std::cout << " nk_irred_interpolate = " << nk_irred_interpolate <<  "\n" ;
+        std::cout << " nk                   = " << nk << "\n";
+        std::cout << " ns                   = " << ns << "\n";
+    }
+
+    deallocate(v4_array_all);
+}
+
 
 void Scph::compute_V3_elements_mpi_over_kpoint(std::complex<double> ***v3_out,
                                                const std::complex<double> *const *const *evec_in,
@@ -1032,9 +1101,13 @@ void Scph::compute_V4_elements_mpi_over_kpoint(std::complex<double> ***v4_out,
     // Calculate the matrix elements of quartic terms in reciprocal space.
     // This is the most expensive part of the SCPH calculation.
 
-    const size_t nk_reduced_interpolate = kmesh_coarse->nk_irred;
-    const size_t ns = dynamical->neval;
-    const size_t ns2 = ns * ns;
+    /*
+    
+    */ 
+
+    const size_t nk_reduced_interpolate = kmesh_coarse->nk_irred; // KMESH_INTERPOLATEのメッシュ数
+    const size_t ns = dynamical->neval; //フォノンモードの数（3N ?）
+    const size_t ns2 = ns * ns; //ns(フォノンモード)の二乗
     const size_t ns3 = ns * ns * ns;
     const size_t ns4 = ns * ns * ns * ns;
     size_t is, js, ks, ls;
@@ -1043,14 +1116,14 @@ void Scph::compute_V4_elements_mpi_over_kpoint(std::complex<double> ***v4_out,
     std::complex<double> ret;
     long int ii;
 
-    const auto nk_scph = kmesh_dense->nk;
+    const auto nk_scph = kmesh_dense->nk; // KMESH_SCPHのメッシュ数（q1についてのメッシュ）
     const auto ngroup_v4 = anharmonic_core->get_ngroup_fcs(4);
     const auto factor = std::pow(0.5, 2) / static_cast<double>(nk_scph);
     static auto complex_zero = std::complex<double>(0.0, 0.0);
     std::complex<double> *v4_array_at_kpair;
     std::complex<double> ***v4_mpi;
 
-    const size_t nk2_prod = nk_reduced_interpolate * nk_scph;
+    const size_t nk2_prod = nk_reduced_interpolate * nk_scph; // KMESH_SCPHとKMESH_INTERPOLATEのメッシュの掛け算
 
     if (mympi->my_rank == 0) {
         if (self_offdiag) {
@@ -1065,10 +1138,11 @@ void Scph::compute_V4_elements_mpi_over_kpoint(std::complex<double> ***v4_out,
     allocate(v4_mpi, nk2_prod, ns2, ns2);
 
     for (size_t ik_prod = mympi->my_rank; ik_prod < nk2_prod; ik_prod += mympi->nprocs) {
-        const auto ik = ik_prod / nk_scph;
-        const auto jk = ik_prod % nk_scph;
+        // amano :: 
+        const auto ik = ik_prod / nk_scph; //こっちがKMESH_SCPHの（fineな）メッシュ
+        const auto jk = ik_prod % nk_scph; //こっちがKMESH_INTERPOLATE（coarseな）のメッシュ
 
-        const unsigned int knum = kmap_interpolate_to_scph[kmesh_coarse->kpoint_irred_all[ik][0].knum];
+        const unsigned int knum = kmap_interpolate_to_scph[kmesh_coarse->kpoint_irred_all[ik][0].knum]; // ikを適切に変換する？
 
         anharmonic_core->calc_phi4_reciprocal(kmesh_dense->xk[knum],
                                               kmesh_dense->xk[jk],
@@ -1092,13 +1166,13 @@ void Scph::compute_V4_elements_mpi_over_kpoint(std::complex<double> ***v4_out,
             }
         }
 
-        if (self_offdiag) {
+        if (self_offdiag) { //非対角成分の計算
 
             // All matrix elements will be calculated when considering the off-diagonal
             // elements of the phonon self-energy (loop diagram).
 
 #pragma omp parallel for private(is, js, ks, ls, ret, i)
-            for (ii = 0; ii < ns4; ++ii) {
+            for (ii = 0; ii < ns4; ++ii) { //nsの4条でis,js,ks,lsについてループ．
                 is = ii / ns3;
                 js = (ii - ns3 * is) / ns2;
                 ks = (ii - ns3 * is - ns2 * js) / ns;
@@ -1109,12 +1183,16 @@ void Scph::compute_V4_elements_mpi_over_kpoint(std::complex<double> ***v4_out,
                 ret = std::complex<double>(0.0, 0.0);
 
                 for (i = 0; i < ngroup_v4; ++i) {
-
+                /*
+                caution !! index transformation is as follows,
+                    v4[ik_prod][ii][is]=v4[knum,is][knum,js][jk,ks][jk,ls]
+                where knum is for SCPH_INTERPOLATE(outer mesh), and jk is for SCPH_MESH(inner mesh).
+                */
                     ret += v4_array_at_kpair[i]
-                           * std::conj(evec_in[knum][is][ind[i][0]])
-                           * evec_in[knum][js][ind[i][1]]
-                           * evec_in[jk][ks][ind[i][2]]
-                           * std::conj(evec_in[jk][ls][ind[i][3]]);
+                           * std::conj(evec_in[knum][is][ind[i][0]]) //is
+                           * evec_in[knum][js][ind[i][1]]            //js
+                           * evec_in[jk][ks][ind[i][2]]              //ks
+                           * std::conj(evec_in[jk][ls][ind[i][3]]);  //ls
                 }
 
                 v4_mpi[ik_prod][ns * is + js][ns * ks + ls] = factor * ret;
@@ -1320,7 +1398,7 @@ void Scph::compute_V4_elements_mpi_over_band(std::complex<double> ***v4_out,
 
     for (ik_prod = 0; ik_prod < nk2_prod; ++ik_prod) {
 #pragma omp parallel for private (js)
-        for (is = 0; is < ns2; ++is) {
+        for (is = 0; is < ns2; ++is) { //初期化？
             for (js = 0; js < ns2; ++js) {
                 v4_mpi[ik_prod][is][js] = complex_zero;
                 v4_out[ik_prod][is][js] = complex_zero;
@@ -1598,7 +1676,7 @@ void Scph::setup_kmesh()
 //        }
     }
 
-    allocate(kmap_interpolate_to_scph, kmesh_coarse->nk);
+    allocate(kmap_interpolate_to_scph, kmesh_coarse->nk); //KMESH_INTERPOLATEの方のmesh
 
     for (ik = 0; ik < kmesh_coarse->nk; ++ik) {
         for (i = 0; i < 3; ++i) xtmp[i] = kmesh_coarse->xk[ik][i];
@@ -2399,8 +2477,8 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
     unsigned int i;
     unsigned int is, js, ks;
     unsigned int kk;
-    const auto nk = kmesh_dense->nk;
-    const auto ns = dynamical->neval;
+    const auto nk = kmesh_dense->nk; // kmesh_scphの方のdenseなmesh
+    const auto ns = dynamical->neval; //フォノンモードの数(3N)
     unsigned int knum, knum_interpolate;
     const auto nk_interpolate = kmesh_coarse->nk;
     const auto nk_irred_interpolate = kmesh_coarse->nk_irred;
@@ -2432,6 +2510,9 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
     std::complex<double> ***dymat_r_new;
     std::complex<double> ***dymat_q, ***dymat_q_HA;
 
+    // amano (ctempを出力するための部分．)
+    std::complex<double> ***print_ctmp;
+
     std::vector<MatrixXcd> dmat_convert, dmat_convert_old;
     std::vector<MatrixXcd> evec_initial;
     std::vector<MatrixXcd> Fmat0;
@@ -2455,11 +2536,14 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
 
     SelfAdjointEigenSolver<MatrixXcd> saes;
 
-    allocate(eval_interpolate, nk, ns);
+    allocate(eval_interpolate, nk, ns); //
     allocate(evec_new, nk, ns, ns);
     allocate(dymat_r_new, ns, ns, nk_interpolate);
     allocate(dymat_q, ns, ns, nk_interpolate);
     allocate(dymat_q_HA, ns, ns, nk_interpolate);
+    
+    // amano (ctempを出力するための部分．)
+    allocate(print_ctmp,nk_irred_interpolate*nk, ns,ns);
 
     const auto T_in = temp;
 
@@ -2569,11 +2653,12 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
         if (iloop > 0) {
 #pragma omp parallel for
             for (ik = 0; ik < nk; ++ik) {
+                // 古いものと新もいものを混ぜている．
                 dmat_convert[ik] = alpha * dmat_convert[ik].eval() + (1.0-alpha) * dmat_convert_old[ik];
             }
         }
-
-        for (ik = 0; ik < nk_irred_interpolate; ++ik) {
+        // * amano 只野さんから言及されたところ
+        for (ik = 0; ik < nk_irred_interpolate; ++ik) { //kmesh_interpolate(outer loop)に関するループ
 
             knum_interpolate = kmesh_coarse->kpoint_irred_all[ik][0].knum;
             knum = kmap_interpolate_to_scph[knum_interpolate];
@@ -2585,7 +2670,11 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
 
             if (!offdiag) {
                 for (is = 0; is < ns; ++is) {
-                    i = (ns + 1) * is;
+                    i = (ns + 1) * is; 
+                    /* caution !!
+                    nsはdynamical->neval(フォノンモードの数)を表す．従ってこれはフォノンモードをあらわしている．
+                    特に，二つのブランチインデックスが等しい場合（i/ns=i%ns)に対応している！
+                    */
 
                     re_tmp = 0.0;
                     im_tmp = 0.0;
@@ -2593,20 +2682,21 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
 #pragma omp parallel for private(jk, kk, ks, ctmp), reduction(+:re_tmp, im_tmp)
                     for (jk = 0; jk < nk; ++jk) {
 
-                        kk = nk * ik + jk;
+                        kk = nk * ik + jk; // q,q'の波数を表す．(ik=0がΓ点．jkの方がq'(finemesh)のインデックス)
 
                         for (ks = 0; ks < ns; ++ks) {
-                            ctmp = v4_array_all[kk][i][(ns + 1) * ks]
-                                   * dmat_convert[jk](ks,ks);
+                            ctmp = v4_array_all[kk][i][(ns + 1) * ks] 
+                                   * dmat_convert[jk](ks,ks); // dmat_convertがK_(q,i,j)に対応している．その対角成分(ks,ks)を取り出している．
                             re_tmp += ctmp.real();
                             im_tmp += ctmp.imag();
+                            print_ctmp[kk][is][ks] = ctmp; // print_ctmpへ代入して最後に出力する．二つの波数indexだけあれば十分．
                         }
                     }
                     Fmat(is, is) += std::complex<double>(re_tmp, im_tmp);
                 }
             } else {
 
-                // Anharmonic correction to Fmat
+                // Anharmonic correction to Fmat (including off-diagonal element)
 
                 for (is = 0; is < ns; ++is) {
                     for (js = 0; js <= is; ++js) {
@@ -2627,6 +2717,9 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
                                            * dmat_convert[jk](ks,ls);
                                     re_tmp += ctmp.real();
                                     im_tmp += ctmp.imag();
+                                    if (js == is && ls == ks){ // diagonalな場合のみを取り出す．
+                                        print_ctmp[kk][is][ks] = ctmp; // print_ctmpへ代入して最後に出力する．二つの波数indexだけあれば十分．
+                                    }
                                 }
                             }
                         }
@@ -2852,6 +2945,30 @@ void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
         }
         flag_converged = false;
     }
+
+    // amano :: print_ctmpの出力
+    std::cout << " print_ctmpを出力します． " << "\n";
+    std::cout <<  "ik jk is  ks eval_interpolate[jk][ks](kayser) print_ctmp[kk][is][ks].real() \n";
+    std::cout << std::endl;
+
+    // 実際の出力
+    for (ik = 0; ik < nk_irred_interpolate; ++ik) {
+
+        for (is = 0; is < ns; ++is) {
+            i = (ns + 1) * is; 
+            /* caution !!
+            nsはdynamical->neval(フォノンモードの数)を表す．従ってこれはフォノンモードをあらわしている．
+            特に，二つのブランチインデックスが等しい場合（i/ns=i%ns)に対応している！
+            */
+            for (jk = 0; jk < nk; ++jk) {
+                kk = nk * ik + jk; // q,q'の波数を表す．(ik=0がΓ点．jkの方がq'(finemesh)のインデックス)
+                for (ks = 0; ks < ns; ++ks) { // ksはq'の方のフォノンモード
+                    // 横軸用にフォノンエネルギーが必要だが，どうやって計算すれば良いのだろうか．．． 
+                    std::cout << std::setw(5) << ik << std::setw(5) << jk << std::setw(5) << is << std::setw(5) << ks << std::setw(15) << writes->in_kayser(eval_interpolate[jk][ks]) << std::setw(15) <<  print_ctmp[kk][is][ks].real() << "\n"; // print_ctmpへ代入して最後に出力する．二つの波数indexだけあれば十分．
+                    }
+                }
+            }
+        }
 
     for (ik = 0; ik < nk; ++ik) {
         for (is = 0; is < ns; ++is) {

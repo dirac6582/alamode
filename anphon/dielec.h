@@ -39,6 +39,9 @@ public:
 
     std::vector<std::vector<double>> get_zstar_mode() const;
 
+    void compute_mode_oscillator_strength(double ***s_born) const; // add by amano
+
+
 private:
 
     void set_default_variables();

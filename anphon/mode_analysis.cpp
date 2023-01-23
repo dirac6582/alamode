@@ -7,7 +7,6 @@ This file is distributed under the terms of the MIT license.
 Please see the file 'LICENCE.txt' in the root directory
 or http://opensource.org/licenses/mit-license.php for information.
 */
-
 #include "mpi_common.h"
 #include "mode_analysis.h"
 #include "anharmonic_core.h"
@@ -51,7 +50,10 @@ void ModeAnalysis::set_default_variables()
     print_V3 = 0;
     print_V4 = 0;
     calc_selfenergy = 0;
+    calc_freq_selfenergy = 0; // add by me 
+    calc_freq_dielecfunction = 0; // add by me
     spectral_func = false;
+//    self_list = 0; // add by me
 }
 
 void ModeAnalysis::deallocate_variables() const {}
@@ -71,6 +73,7 @@ void ModeAnalysis::setup_mode_analysis()
             std::cout << " will be performed instead of thermal conductivity calculation." << std::endl;
             std::cout << std::endl;
 
+            // read the KS_INPUT file
             std::ifstream ifs_ks;
             ifs_ks.open(ks_input.c_str(), std::ios::in);
             if (!ifs_ks)
@@ -81,7 +84,7 @@ void ModeAnalysis::setup_mode_analysis()
             double ktmp[3];
             unsigned int snum_tmp;
 
-            ifs_ks >> nlist;
+            ifs_ks >> nlist; //read the first line
 
             if (nlist <= 0)
                 exit("setup_mode_analysis",
@@ -104,17 +107,27 @@ void ModeAnalysis::setup_mode_analysis()
                           << kslist_fstate_k.size() << std::endl;
             } else {
                 kslist.clear();
-                for (i = 0; i < nlist; ++i) {
-                    ifs_ks >> ktmp[0] >> ktmp[1] >> ktmp[2] >> snum_tmp;
+                int i=0;
+                std::string garbage; // allow comments 
+                while (i < nlist){
+                // for (i = 0; i < nlist; ++i) {  // original
+                    // 先よみして#スタートの場合は飛ばす
+                    char c = ifs_ks.peek();
+                    if (c == '#' || c == '\n') {
+                        ifs_ks.ignore(256, '\n');
+                    continue;
+                    }  
+                    ifs_ks >> ktmp[0] >> ktmp[1] >> ktmp[2] >> snum_tmp >> garbage ; // allow comments in the end
                     const auto knum_tmp = dos->kmesh_dos->get_knum(ktmp);
+                    i = i+1;
 
-                    if (knum_tmp == -1)
+                    if (knum_tmp == -1) 
                         exit("setup_mode_analysis",
                              "Given kpoint does not exist in given k-point grid.");
                     if (snum_tmp <= 0 || snum_tmp > dynamical->neval) {
                         exit("setup_mode_analysis", "Mode index out of range.");
                     }
-                    kslist.push_back(knum_tmp * dynamical->neval + snum_tmp - 1);
+                    kslist.push_back(knum_tmp * dynamical->neval + snum_tmp - 1); 
                 }
                 std::cout << " The number of entries = " << kslist.size() << std::endl;
             }
@@ -132,8 +145,11 @@ void ModeAnalysis::setup_mode_analysis()
     MPI_Bcast(&calc_fstate_k, 1, MPI_CXX_BOOL, 0, MPI_COMM_WORLD);
     MPI_Bcast(&print_V3, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&print_V4, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&calc_selfenergy, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&calc_selfenergy, 1, MPI_INT, 0, MPI_COMM_WORLD); //ここが大事？
+    MPI_Bcast(&calc_freq_selfenergy, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&calc_freq_dielecfunction, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&spectral_func, 1, MPI_CXX_BOOL, 0, MPI_COMM_WORLD);
+//    MPI_Bcast(&self_list, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     unsigned int nlist;
 
@@ -144,7 +160,6 @@ void ModeAnalysis::setup_mode_analysis()
         }
         double **vec_tmp;
         unsigned int *mode_tmp;
-
 
         // Broadcast kslist_fstate_k
 
@@ -270,15 +285,21 @@ void ModeAnalysis::run_mode_analysis()
     allocate(T_arr, NT);
     for (unsigned int i = 0; i < NT; ++i) T_arr[i] = Tmin + static_cast<double>(i) * dT;
 
-    const auto epsilon = integration->epsilon;
+    const auto epsilon = integration->epsilon; //smearing
 
     if (calc_fstate_k) {
         // Momentum-resolved final state amplitude
         print_momentum_resolved_final_state(NT, T_arr, epsilon);
 
     } else {
-
+        // dielectric function
+        if (calc_freq_dielecfunction) print_dielecfunction(NT, T_arr);
+        
+        // frequency-independent selfenergy
         if (calc_selfenergy) print_selfenergy(NT, T_arr);
+
+        // frequency-dependent selfenergy
+        if (calc_freq_selfenergy) print_frequency_dependent_selfenergy(NT, T_arr);
 
         if (print_V3 == 1) {
             print_V3_elements();
@@ -301,13 +322,144 @@ void ModeAnalysis::run_mode_analysis()
     deallocate(T_arr);
 }
 
+
+void ModeAnalysis::print_frequency_dependent_selfenergy(const unsigned int NT,
+                          double *T_arr)
+{
+    /*
+    calculate specified frequency-dependent self-energies for given phonon modes
+    */
+    auto ns = dynamical->neval;
+
+    std::ofstream ofs_freq_self; // for outputing frequency-dependent self-energy
+
+    std::complex<double> *self_freq_a = nullptr; //bubble
+    std::complex<double> *self_freq_c = nullptr; //4ph
+
+    if (mympi->my_rank == 0) {
+        std::cout << std::endl;
+        std::cout << " ------------------------------------------ " << std::endl;
+        std::cout << " (ModeAnalysis) Calculate the frequency-dependent self energy " << std::endl;
+        std::cout << " due to 3-phonon interactions for given "
+                  << kslist.size() << " modes." << std::endl;
+        std::cout << "" << std::endl;
+
+        if (anharmonic_core->flg_bubble == 1) {
+            std::cout << std::endl;
+            std::cout << " flg_bubble = 1 : calculate bubble self energy " << std::endl;
+        } 
+        if (anharmonic_core->flg_4ph == 1) {
+            std::cout << std::endl;
+            std::cout << " flg_4ph    = 1 : calculate 4ph self energy  " << std::endl;
+        } 
+    }
+
+    // 振動数依存4ph/bubbleに必要なオメガのリストの準備
+    const auto Omega_min = dos->emin;
+    const auto Omega_max = dos->emax;
+    const auto delta_omega = dos->delta_e;
+    double omega2[2];
+    const auto nomega = static_cast<unsigned int>((Omega_max - Omega_min) / delta_omega) + 1;
+    double *omega_array;
+
+    allocate(omega_array, nomega);
+
+    for (unsigned int iomega = 0; iomega < nomega; ++iomega) {
+        omega_array[iomega] = Omega_min + delta_omega * static_cast<double>(iomega);
+        omega_array[iomega] *= time_ry / Hz_to_kayser;
+    }
+    // ---------------------
+    if (anharmonic_core->flg_bubble == 1) {
+        allocate(self_freq_a, nomega);
+    }
+    if (anharmonic_core->flg_4ph == 1) {
+        allocate(self_freq_c, nomega);
+    }
+
+    // loop for given phonon modes
+    for (int i = 0; i < kslist.size(); ++i) {
+        const auto knum = kslist[i] / ns;
+        const auto snum = kslist[i] % ns;
+
+        const auto omega = dos->dymat_dos->get_eigenvalues()[knum][snum]; // phonon frequency for given mode
+    
+        if (mympi->my_rank == 0) { // print mode info to output
+            output_mode_information(i,knum,snum,omega);
+        }
+
+        const auto ik_irred = dos->kmesh_dos->kmap_to_irreducible[knum];
+
+        if (anharmonic_core->flg_4ph == 1) {
+   	    // 4ph-diagram の計算
+            selfenergy->selfenergy_c_amano(NT, T_arr, knum, snum,
+                                     dos->kmesh_dos,
+                                     dos->dymat_dos->get_eigenvalues(),
+                                     dos->dymat_dos->get_eigenvectors(),
+                                     nomega, 
+                                     omega_array,
+                                     self_freq_c);
+            if (mympi->my_rank == 0) {
+                std::cout << std::endl;
+                std::cout << "   Finish calculation of diagram_c_amano (4ph) " << std::endl;
+            }
+        }
+
+        if (anharmonic_core->flg_bubble == 1) {
+   	    // bubble-diagram の計算
+            selfenergy->selfenergy_a_amano(NT, T_arr, knum, snum,
+                                     dos->kmesh_dos,
+                                     dos->dymat_dos->get_eigenvalues(),
+                                     dos->dymat_dos->get_eigenvectors(),
+                                     nomega, 
+                                     omega_array,
+                                     self_freq_a);
+            if (mympi->my_rank == 0) {
+                std::cout << std::endl;
+                std::cout << "   Finish calculation of diagram_a_amano (bubble) " << std::endl;
+            }
+        }
+
+        //
+        // output results to .Self4ph/.SelfBubble files
+        //
+        // for 4ph self energy
+        if (anharmonic_core->flg_4ph == 1){
+            if (mympi->my_rank == 0) {
+                output_selfenergy_information(NT, T_arr, i, knum, snum, 
+                                              nomega, omega_array, 
+                                              self_freq_c, ".Self4ph");
+            }   
+        }
+        // for bubble self energy
+        if (anharmonic_core->flg_bubble == 1) {
+            if (mympi->my_rank == 0) {   
+                output_selfenergy_information(NT, T_arr, i, knum, snum, 
+                                               nomega, omega_array, 
+                                               self_freq_a, ".SelfBubble");
+            }
+        }
+    }
+
+    if (self_freq_a) {
+        deallocate(self_freq_a);
+    }
+    if (self_freq_c) {
+        deallocate(self_freq_c);
+    }
+}
+
 void ModeAnalysis::print_selfenergy(const unsigned int NT,
                                     double *T_arr)
 {
+    /*
+    calculate specified self-energies for given phonon modes
+    */
     auto ns = dynamical->neval;
     int j;
 
     std::ofstream ofs_linewidth, ofs_shift;
+    std::ofstream ofs_self; // for outputing frequency-dependent self-energy
+    unsigned int iomega;    // for frequency-dependent self-energy
 
     double *damping_a = nullptr;
     std::complex<double> *self_tadpole = nullptr;
@@ -324,17 +476,28 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
 
     if (mympi->my_rank == 0) {
         std::cout << std::endl;
-        std::cout << " Calculate the line width (FWHM) of phonons" << std::endl;
+        std::cout << " ------------------------------------------ " << std::endl;
+        std::cout << " (ModeAnalysis) Calculate the line width (FWHM)/frequency shift of phonons" << std::endl;
         std::cout << " due to 3-phonon interactions for given "
                   << kslist.size() << " modes." << std::endl;
+        std::cout << "" << std::endl;
+        std::cout << " WARNING : Only one temperature (TMAX=TMIN) is allowed " << std::endl;
+        std::cout << "" << std::endl;
+
 	//
-	// REALPART=Trueの場合には線幅を計算
+	// REALPART=Trueの場合には実部（振動数シフト）を計算
         if (calc_realpart) {
-            if (anharmonic_core->quartic_mode == 1) {
+            std::cout << " REALPART = 1 :: invoke frequency shift calculation" << std::endl; 
+            if (anharmonic_core->quartic_mode >= 1) { // REALPART=1, QUARTIC=1：tadpole,bubble,loopの実部
                 std::cout << " REALPART = 1 and " << std::endl;
                 std::cout << " QUARTIC  = 1 : Additionally, frequency shift of phonons due to 3-phonon" << std::
                 endl;
-                std::cout << "                    and 4-phonon interactions will be calculated." << std::endl;
+                std::cout << "                    and 4-phonon (Loop) interactions will be calculated." << std::endl;
+            } else if (anharmonic_core->quartic_mode == 2) { // (add by me !!) REALPART=1, QUARTIC=2：4phの実部
+                std::cout << " REALPART = 1 and " << std::endl;
+                std::cout << " QUARTIC  = 2 : Additionally, frequency shift of phonons due to the 4ph diagram" << std::
+                endl;
+                std::cout << "                    will be calculated." << std::endl;
             } else {
                 std::cout << " REALPART = 1 : Additionally, frequency shift of phonons due to 3-phonon" << std::
                 endl;
@@ -342,12 +505,17 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
             }
         }
 	// それ以外の場合には虚部を計算する．
-        if (anharmonic_core->quartic_mode == 2) {
-            std::cout << std::endl;
-            std::cout << " QUARTIC = 2 : Additionally, phonon line width due to 4-phonon" << std::endl;
-            std::cout << "               interactions will be calculated." << std::endl;
-            std::cout << " WARNING     : This is very very expensive." << std::endl;
-        }
+        if (calc_realpart == false){
+            if (anharmonic_core->quartic_mode == 1) {
+                std::cout << std::endl;
+                std::cout << " WARNING :: QUARTIC=1 and calc_realpart=0 is meaningless " << std::endl;
+                std::cout << std::endl;
+            } else if (anharmonic_core->quartic_mode == 2) {
+                std::cout << std::endl;
+                std::cout << " QUARTIC = 2 : Additionally, phonon line width due to 4-phonon (4ph) " << std::endl;
+                std::cout << "               interactions will be calculated." << std::endl;
+                std::cout << " WARNING     : This is very very expensive." << std::endl;
+            } 
 
 	// add by me!!
 	// for complex system, we just calculate 4ph-diagram
@@ -358,11 +526,12 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
             std::cout << " WARNING     : This is very expensive." << std::endl;
         }
 
+        }
     }
-    
+    // memory allocation
     allocate(damping_a, NT);
-    allocate(self_a, NT);
-    allocate(self_b, NT);
+    allocate(self_a, NT); //bubble
+    allocate(self_b, NT); //Loop
     allocate(self_tadpole, NT);
 
     if (anharmonic_core->quartic_mode == 2) {
@@ -379,32 +548,22 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
         allocate(self_c, NT);
     }
 
-
-    
+    // k点(というか計算するモード)に関するループ
     for (int i = 0; i < kslist.size(); ++i) {
         const auto knum = kslist[i] / ns;
         const auto snum = kslist[i] % ns;
 
         const auto omega = dos->dymat_dos->get_eigenvalues()[knum][snum];
 
-        if (mympi->my_rank == 0) {
-            std::cout << std::endl;
-            std::cout << " Number : " << std::setw(5) << i + 1 << std::endl;
-            std::cout << "  Phonon at k = (";
-            for (j = 0; j < 3; ++j) {
-                std::cout << std::setw(10) << std::fixed << dos->kmesh_dos->xk[knum][j];
-                if (j < 2) std::cout << ",";
-            }
-            std::cout << ")" << std::endl;
-            std::cout << "  Mode index = " << std::setw(5) << snum + 1 << std::endl;
-            std::cout << "  Frequency (cm^-1) : "
-                      << std::setw(15) << writes->in_kayser(omega) << std::endl;
+        if (mympi->my_rank == 0) { // print mode info to output
+            output_mode_information(i,knum,snum,omega);
         }
 
         const auto ik_irred = dos->kmesh_dos->kmap_to_irreducible[knum];
 
+        // bubble diagram(diagram_a)
         if (integration->ismear == -1) {
-	  // ismear=-1の時はtetrahedronで計算
+            // ismear=-1 :: tetrahedron
             anharmonic_core->calc_damping_tetrahedron(NT, T_arr, omega, ik_irred, snum,
                                                       dos->kmesh_dos,
                                                       dos->dymat_dos->get_eigenvalues(),
@@ -416,16 +575,26 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
                                      dos->dymat_dos->get_eigenvalues(),
                                      dos->dymat_dos->get_eigenvectors(),
                                      self_a);
-            for (j = 0; j < NT; ++j) damping_a[j] = self_a[j].imag();
+            for (j = 0; j < NT; ++j) damping_a[j] = self_a[j].imag(); // dampings
         }
+        if (mympi->my_rank == 0) {
+            std::cout << std::endl;
+            std::cout << "   Finish calculation of diagram_a (bubble) " << std::endl;
+        }
+        // 
         if (anharmonic_core->quartic_mode == 2) {
 	    // 4ph-diagram 
             selfenergy->selfenergy_c(NT, T_arr, omega, knum, snum,
                                      dos->kmesh_dos,
-                                     dos->dymat_dos->get_eigenvalues(),
-                                     dos->dymat_dos->get_eigenvectors(),
-                                     self_c);
-//            selfenergy->selfenergy_d(NT, T_arr, omega, knum, snum,
+                                    dos->dymat_dos->get_eigenvalues(),
+                                    dos->dymat_dos->get_eigenvectors(),
+                                    self_c);
+
+            if (mympi->my_rank == 0) {
+                std::cout << std::endl;
+                std::cout << "   Finish calculation of diagram_c (4ph) " << std::endl;
+            }
+//            selfenergy->selfenergy_d(NTz, T_arr, omega, knum, snum,
 //                                     dos->kmesh_dos,
 //                                     dos->dymat_dos->get_eigenvalues(),
 //                                     dos->dymat_dos->get_eigenvectors(),
@@ -460,7 +629,8 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
 //                                     dos->dymat_dos->get_eigenvalues(),
 //                                     dos->dymat_dos->get_eigenvectors(),
 //                                     self_j);
-        }
+        }  
+
 
         if (mympi->my_rank == 0) {
             auto file_linewidth = input->job_title + ".Gamma." + std::to_string(i + 1);
@@ -472,7 +642,7 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
             ofs_linewidth << "# xk = ";
 
             for (j = 0; j < 3; ++j) {
-                ofs_linewidth << std::setw(15) << dos->kmesh_dos->xk[knum][j];
+                ofs_linewidth << std::setw(15) << dos->kmesh_dos->xk[knum][j]; //q-point
             }
             ofs_linewidth << std::endl;
             ofs_linewidth << "# mode = " << snum + 1 << std::endl;
@@ -503,24 +673,34 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
             ofs_linewidth.close();
             std::cout << "  Phonon line-width is printed in " << file_linewidth << std::endl;
         }
-	
+
+        //
+        // ----------  Calculation of realpart ------------------
         if (calc_realpart) {
             selfenergy->selfenergy_tadpole(NT, T_arr, omega, knum, snum,
                                            dos->kmesh_dos,
                                            dos->dymat_dos->get_eigenvalues(),
                                            dos->dymat_dos->get_eigenvectors(),
                                            self_tadpole);
-            // selfenergy->selfenergy_a(NT, T_arr, omega, knum, snum, self_a);
-	    
-	    // if quartic_mode == 1, then calculate Loop diagram shift
-            if (anharmonic_core->quartic_mode == 1) {
+            if (mympi->my_rank == 0) {
+                std::cout << std::endl;
+                std::cout << "   Finish calculation of diagram_tadpole for frequency shift " << std::endl;
+            }
+
+	        // if quartic_mode == 1, calculate Loop diagram shift
+            if (anharmonic_core->quartic_mode >= 1) {
                 selfenergy->selfenergy_b(NT, T_arr, omega, knum, snum,
                                          dos->kmesh_dos,
                                          dos->dymat_dos->get_eigenvalues(),
                                          dos->dymat_dos->get_eigenvectors(),
                                          self_b);
+                if (mympi->my_rank == 0) {
+                    std::cout << std::endl;
+                    std::cout << "   Finish calculation of diagram_Loop for frequency shift " << std::endl;
+                }
             }
-
+	        // if quartic_mode == 2, calculation was finished in damping part
+            
             if (mympi->my_rank == 0) {
                 auto file_shift = input->job_title + ".Shift." + std::to_string(i + 1);
                 ofs_shift.open(file_shift.c_str(), std::ios::out);
@@ -537,7 +717,8 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
                 ofs_shift << "# mode = " << snum + 1 << std::endl;
                 ofs_shift << "# Frequency = " << writes->in_kayser(omega) << std::endl;
                 ofs_shift << "## T[K], Shift3 (cm^-1) (tadpole), Shift3 (cm^-1) (bubble)";
-                if (anharmonic_core->quartic_mode == 1) ofs_shift << ", Shift4 (cm^-1) (loop)";
+                if (anharmonic_core->quartic_mode >= 1) ofs_shift << ", Shift4 (cm^-1) (loop)";
+                if (anharmonic_core->quartic_mode == 2) ofs_shift << ", Shift4 (cm^-1) (4ph)";
                 ofs_shift << ", Shifted frequency (cm^-1)";
                 ofs_shift << std::endl;
 
@@ -548,9 +729,13 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
 		    //最終的な振動数(omega-delta Omega)を計算
                     auto omega_shift = omega - self_tadpole[j].real() - self_a[j].real();
 		    //if anharmonic_core == 1, then calculate loop-diagram.
-                    if (anharmonic_core->quartic_mode == 1) {
+                    if (anharmonic_core->quartic_mode >= 1) {
                         ofs_shift << std::setw(15) << writes->in_kayser(-self_b[j].real());
                         omega_shift -= self_b[j].real();
+                    }
+                    if (anharmonic_core->quartic_mode == 2) {
+                        ofs_shift << std::setw(15) << writes->in_kayser(-self_c[j].real());
+                        omega_shift -= self_c[j].real();
                     }
                     ofs_shift << std::setw(15) << writes->in_kayser(omega_shift);
                     ofs_shift << std::endl;
@@ -560,7 +745,7 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
                 std::cout << "  Phonon frequency shift is printed in " << file_shift << std::endl;
             }
         }
-    }
+    }        
 
     if (damping_a) {
         deallocate(damping_a);
@@ -599,6 +784,339 @@ void ModeAnalysis::print_selfenergy(const unsigned int NT,
         deallocate(self_j);
     }
 }
+
+
+void ModeAnalysis::print_dielecfunction(const unsigned int NT,
+                          double *T_arr)
+{
+    if (mympi->my_rank == 0) {
+        std::cout << std::endl;
+        std::cout << " ------------------------------------------ " << std::endl;
+        std::cout << "   print_dielecfunction :: calculate frequency-dependent dielectric function with self-energies " << std::endl;
+        std::cout << std::endl;        
+        std::cout << "  Volume of the primitive cell : " // see system.cpp
+                  << std::setw(15) << system->volume_p << " (a.u.)^3" << std::endl << std::endl;
+    }
+
+    const auto ns = dynamical->neval; // # of mode
+
+    // gamma point phonon frequencies
+    double ktmp[3]= {0.0, 0.0, 0.0}; // gamma-point
+    auto knum_tmp = dos->kmesh_dos->get_knum(ktmp); 
+    double gamma_frequency[ns];
+
+    if (mympi->my_rank == 0){
+        std::cout << " Gamma-point Phonon Frequency (cm^-1) : " << std::endl;
+    }
+
+    for (auto snum=0; snum < ns; ++snum){
+        gamma_frequency[snum] = dos->dymat_dos->get_eigenvalues()[knum_tmp][snum];
+        if (mympi->my_rank == 0) {
+            output_mode_information(snum, knum_tmp, snum, gamma_frequency[snum]);
+//            std::cout << " Gamma-point Phonon Frequency (cm^-1) : " << writes->in_kayser(gamma_frequency[snum]) << std::endl;  
+        }
+    }
+
+    // ----
+    //変換係数を一応計算しておく
+    auto freq_conv_factor = time_ry * time_ry / (Hz_to_kayser * Hz_to_kayser);
+    auto factor = 8.0 * pi / system->volume_p;
+    // ----
+
+    // compute mode effective charge
+    auto zstar_born = dielec->get_zstar_mode();
+
+    // compute mode oscillator strength
+    double ***mode_strength = nullptr;
+    allocate(mode_strength, 3, 3, ns);
+    dielec->compute_mode_oscillator_strength(mode_strength);
+
+    // ----------
+    
+    // pick modes with non-zero oscillator strength
+    if (mympi->my_rank == 0) {
+        std::cout << " Modes with non-zero oscillator strength... " << std::endl;
+    }
+
+    double sum_strength; 
+    int nonzero_mode[ns]; // list for nonzero_mode
+    for (auto is = 0; is < ns; ++is) {
+        nonzero_mode[is] = -1; //-1で初期化
+    }
+
+    for (auto is = 0; is < ns; ++is) {
+        sum_strength=0;
+        for (auto i = 0; i < 3; ++i) {
+            for (auto j = 0; j < 3; ++j) {
+                sum_strength+= std::abs(mode_strength[i][j][is]);         
+            }
+        }
+        if (sum_strength > 0.0001 ){
+            nonzero_mode[is]=-10; //計算するやつらは-10
+            if (mympi->my_rank == 0) {
+                std::cout << "# Mode " << std::setw(5) << is + 1 << " " << sum_strength << std::endl;
+            }
+        }   
+    }
+
+    //* extrach degenerate phonon modes
+    // if nonzero_mode=1, calculate selfenergy. 
+    // if nonzero_mode="num">3, the phonon has the same frequency as "num"
+    for (auto is = 0; is < ns-1 ; ++is){
+        if( nonzero_mode[is] != -1 ){ 
+            for (auto j = is+1 ; j < ns ; ++j){ 
+                if ( std::abs(gamma_frequency[j]-gamma_frequency[is]) < 0.000001 ){
+                    if( nonzero_mode[j] == -10 ){      
+                        nonzero_mode[j]=is;
+                    }
+                }
+            }
+        }
+    }
+    if (mympi->my_rank == 0) {
+        std::cout << " Modes to be calculated ... " << std::endl;
+        for (auto i=0; i< ns; ++i){
+            std::cout << "# Mode " << std::setw(5) << nonzero_mode[i] << std::endl;
+        }
+    }
+
+
+
+    if (mympi->my_rank == 0) { // output .zmode and .strength
+
+        std::string file_zstar = input->job_title + ".zmode";
+        std::ofstream ofs_zstar;
+        ofs_zstar.open(file_zstar.c_str(), std::ios::out);
+        if (!ofs_zstar)
+            exit("print_normalmode_borncharge",
+                 "Cannot open file file_zstar");
+
+        ofs_zstar << "# Born effective charges of each phonon mode at q = (0, 0, 0). Unit is (amu)^{-1/2}\n";
+        for (auto is = 0; is < ns; ++is) {
+            ofs_zstar << "# Mode " << std::setw(5) << is + 1 << '\n';
+            ofs_zstar << "# Frequency (cm^-1) : "
+                      << std::setw(15) << writes->in_kayser(gamma_frequency[is]) << '\n';
+            ofs_zstar << "#";
+            ofs_zstar << std::setw(14) << 'x';
+            ofs_zstar << std::setw(15) << 'y';
+            ofs_zstar << std::setw(15) << 'z';
+            ofs_zstar << '\n';
+            for (auto i = 0; i < 3; ++i) {
+                ofs_zstar << std::setw(15) << std::fixed << zstar_born[is][i];
+            }
+            ofs_zstar << "\n\n";
+        }
+        std::cout << "  mode effective charge  is printed in " << file_zstar << std::endl;
+        ofs_zstar.close();
+
+        std::string file_strength = input->job_title + ".strength";
+        std::ofstream ofs_strength;
+        ofs_strength.open(file_strength.c_str(), std::ios::out);
+        if (!ofs_strength)
+            exit("print_normalmode_borncharge",
+                 "Cannot open file file_zstar");
+
+        ofs_strength << "# Mode oscillator strengthes of each phonon mode at q = (0, 0, 0). Unit is (amu)^{-1/2}\n";
+        for (auto is = 0; is < ns; ++is) {
+            ofs_strength << "# Mode " << std::setw(5) << is + 1 << '\n';
+            ofs_strength << "#  Frequency (cm^-1) : "
+                         << std::setw(15) << writes->in_kayser(gamma_frequency[is]) << '\n';
+            ofs_strength << "#";
+            ofs_strength << std::setw(14) << "xx";
+            ofs_strength << std::setw(15) << "xy";
+            ofs_strength << std::setw(15) << "xz";
+            ofs_strength << std::setw(15) << "yx";
+            ofs_strength << std::setw(15) << "yy";
+            ofs_strength << std::setw(15) << "yz";
+            ofs_strength << std::setw(15) << "zx";
+            ofs_strength << std::setw(15) << "zy";
+            ofs_strength << std::setw(15) << "zz";
+
+            ofs_strength << '\n';
+            for (auto i = 0; i < 3; ++i) {
+                for (auto j = 0; j < 3; ++j) {
+                    ofs_strength << std::setw(15) << std::fixed << mode_strength[i][j][is];
+                }
+            }
+            ofs_strength << "\n\n";
+        }
+        std::cout << "  mode oscillator strength  is printed in " << file_strength << std::endl;
+        ofs_strength.close();
+
+        // strength/V
+        std::string file_V_strength = input->job_title + ".V_strength";
+        std::ofstream ofs_V_strength;
+        ofs_V_strength.open(file_V_strength.c_str(), std::ios::out);
+        if (!ofs_V_strength)
+            exit("print_normalmode_borncharge",
+                 "Cannot open file file_zstar");
+
+	ofs_V_strength << "# Epsilon_inf from BORNINFO file\n";
+	// dynamical->dielec
+    ofs_V_strength << "# Mode oscillator strengthes/Volume[Ang^3] of each phonon mode at q = (0, 0, 0). Unit is (amu)^{-1/2}/Ang^3\n";
+    ofs_V_strength << "# supercell volume is ... " << std::setw(5) << system->volume_p << "\n";
+        for (auto is = 0; is < ns; ++is) {
+            ofs_V_strength << "# Mode " << std::setw(5) << is + 1 << '\n';
+            ofs_V_strength << "#  Calculation_flag " << std::setw(5) << nonzero_mode[is] << '\n';	    
+            ofs_V_strength << "#  Frequency (cm^-1) : "
+                         << std::setw(15) << writes->in_kayser(gamma_frequency[is]) << '\n';
+            ofs_V_strength << "#";
+            ofs_V_strength << std::setw(14) << "xx";
+            ofs_V_strength << std::setw(15) << "xy";
+            ofs_V_strength << std::setw(15) << "xz";
+            ofs_V_strength << std::setw(15) << "yx";
+            ofs_V_strength << std::setw(15) << "yy";
+            ofs_V_strength << std::setw(15) << "yz";
+            ofs_V_strength << std::setw(15) << "zx";
+            ofs_V_strength << std::setw(15) << "zy";
+            ofs_V_strength << std::setw(15) << "zz";
+
+            ofs_V_strength << '\n';
+            for (auto i = 0; i < 3; ++i) {
+                for (auto j = 0; j < 3; ++j) {
+                    ofs_V_strength << std::setw(15) << std::fixed << std::setprecision(10) << mode_strength[i][j][is]/system->volume_p;
+                }
+            }
+            ofs_V_strength << "\n\n";
+        }
+        std::cout << "  mode oscillator strength/Volume  is printed in " << file_V_strength << std::endl;
+        ofs_V_strength.close();
+
+    }
+
+
+    
+    deallocate(mode_strength);
+
+    /*
+    * calculate specified frequency-dependent self-energies for nonzero_mode_duplicate=1
+    */
+
+    std::complex<double> *self_freq_a = nullptr; //bubble
+    std::complex<double> *self_freq_c = nullptr; //4ph
+
+    if (mympi->my_rank == 0) {
+        std::cout << std::endl;
+        std::cout << " ————————————————————— " << std::endl;
+        std::cout << " (Dielecfunction) Calculate the frequency-dependent self energy " << std::endl;
+        std::cout << " due to 3-phonon/4-phonon interactions " << std::endl;
+        std::cout << "" << std::endl;
+        std::cout << " WARNING : Only one temperature (TMAX=TMIN) is allowed " << std::endl;
+        std::cout << "" << std::endl;
+
+        std::cout << " flg_bubble " << anharmonic_core->flg_bubble << std::endl;
+        std::cout << " flg_4ph    " << anharmonic_core->flg_4ph    << std::endl;
+
+
+        if (anharmonic_core->flg_bubble == 1) {
+            std::cout << std::endl;
+            std::cout << " flg_bubble = 1 : calculate bubble self energy " << std::endl;
+        } 
+        if (anharmonic_core->flg_4ph == 1) {
+            std::cout << std::endl;
+            std::cout << " flg_4ph    = 1 : calculate 4ph self energy  " << std::endl;
+        } 
+    }
+
+    // 振動数依存4ph/bubbleのテスト
+    // 振動数依存4ph/bubbleに必要なオメガのリストの準備
+    const auto Omega_min = dos->emin;
+    const auto Omega_max = dos->emax;
+    const auto delta_omega = dos->delta_e;
+    double omega2[2];
+    const auto nomega = static_cast<unsigned int>((Omega_max - Omega_min) / delta_omega) + 1;
+    double *omega_array;
+
+    allocate(omega_array, nomega);
+    // ---------------------
+    for (unsigned int iomega = 0; iomega < nomega; ++iomega) {
+        omega_array[iomega] = Omega_min + delta_omega * static_cast<double>(iomega);
+        omega_array[iomega] *= time_ry / Hz_to_kayser;
+    }
+
+    if (anharmonic_core->flg_bubble == 1) {
+        allocate(self_freq_a, nomega);
+    }
+    if (anharmonic_core->flg_4ph == 1) {
+        allocate(self_freq_c, nomega);
+    }
+
+    // loop for phonon modes
+    for (int i = 0; i < ns ; ++i) {
+        if (nonzero_mode[i] == -10){ 
+
+            const auto omega = dos->dymat_dos->get_eigenvalues()[knum_tmp][i]; // phonon frequency for given mode
+    
+            if (mympi->my_rank == 0) { // print mode info to output
+                output_mode_information(i, knum_tmp, i, omega);
+            }
+
+            const auto ik_irred = dos->kmesh_dos->kmap_to_irreducible[knum_tmp];
+
+            if (anharmonic_core->flg_bubble == 1) {
+                if (mympi->my_rank == 0) {
+                    std::cout << std::endl;
+                    std::cout << "   Start calculation of diagram_a_amano (bubble) " << std::endl;
+                }
+       	    // bubble-diagram
+                selfenergy->selfenergy_a_amano(NT, T_arr, knum_tmp, i,
+                                            dos->kmesh_dos,
+                                        dos->dymat_dos->get_eigenvalues(),
+                                        dos->dymat_dos->get_eigenvectors(),
+                                        nomega, 
+                                        omega_array,
+                                        self_freq_a);
+                if (mympi->my_rank == 0) {
+                    std::cout << std::endl;
+                    std::cout << "   Finish calculation of diagram_a_amano (bubble) " << std::endl;
+                }
+            }
+
+            if (anharmonic_core->flg_4ph == 1) {
+                if (mympi->my_rank == 0) {
+                    std::cout << std::endl;
+                    std::cout << "   Start calculation of diagram_c_amano (4ph) " << std::endl;
+                }
+       	    // 4ph-diagram 
+                selfenergy->selfenergy_c_amano(NT, T_arr, knum_tmp, i,
+                                      dos->kmesh_dos,
+                                      dos->dymat_dos->get_eigenvalues(),
+                                      dos->dymat_dos->get_eigenvectors(),
+                                      nomega, 
+                                      omega_array,
+                                      self_freq_c);
+                if (mympi->my_rank == 0) {
+                    std::cout << std::endl;
+                    std::cout << "   Finish calculation of diagram_c_amano (4ph) " << std::endl;
+                }
+            }
+            // output results
+            if (anharmonic_core->flg_bubble == 1){
+                if (mympi->my_rank == 0) {
+                output_selfenergy_information(NT, T_arr, i, knum_tmp, i, 
+                                          nomega, omega_array, 
+                                          self_freq_a, ".SelfBubble");
+                }
+            }
+            if (anharmonic_core->flg_4ph == 1){
+                if (mympi->my_rank == 0) {
+                output_selfenergy_information(NT, T_arr, i, knum_tmp, i, 
+                                              nomega, omega_array, 
+                                          self_freq_c, ".Self4ph");
+                }
+            }
+        }
+    }
+
+    if (self_freq_a) {
+        deallocate(self_freq_a);
+    }
+    if (self_freq_c) {
+        deallocate(self_freq_c);
+    }
+}
+
+
 
 void ModeAnalysis::print_frequency_resolved_final_state(const unsigned int NT,
                                                         double *T_arr)
@@ -712,6 +1230,7 @@ void ModeAnalysis::print_frequency_resolved_final_state(const unsigned int NT,
     deallocate(freq_array);
     deallocate(gamma_final);
 }
+
 
 void ModeAnalysis::calc_frequency_resolved_final_state(const unsigned int ntemp,
                                                        const double *temperature,
@@ -1757,6 +2276,33 @@ void ModeAnalysis::print_V4_elements() const
                                              true,
                                              quartet);
         const auto nk_size = quartet.size();
+        
+        // add by amano for debug (print k-point itself) 
+        // -k1=ik_irredになっており，その他の点についてのリストを得ている．
+        if (mympi->my_rank == 0)   std::cout << "custom :: size of quartet(kpoints satisfying -k1+k2+k3+k4=G) :: " << nk_size <<  std::endl;
+//
+//        もしもk点をprintoutしたい場合には以下のコードを改造して利用すること．
+//        if (mympi->my_rank == 0){
+//          std::cout << " List of kpoints satisfying k1+k2=G in original  " << std::endl ;
+//          for (int i=0;i<triplet.size();i++){ //triplet[i].group.size()=2 もしペアのk点が違えば(k1,k2),(k2,k1)が入っている.よってgroup[0]のみ扱\
+// えばok.
+//            std::cout << i << ":   "  ;
+//            std::cout <<  " ks.sym= " << triplet[i].group[0].symnum << std::endl ;
+//            std::cout << std::fixed << " " << triplet[i].group[0].ks[0]  << std::endl;
+//            for (int k=0;k<triplet[i].group[0].ks.size(); k++){
+//              std::cout << "     " << triplet[i].group[0].ks[k] << " " ;
+//              const auto ik = triplet[i].group[0].ks[k]; //irred-k点に変換?
+//              std::cout << ik << " " ;
+//              for (int j = 0; j < 3; ++j) { //実際のk点のリストとして書き出す場合はこれを利用.
+//                  std::cout << std::setprecision(5) << std::setw(14)
+//                            << std::scientific << kmesh_dos->xk[ik][j];
+//               }
+//              std::cout << "     :     " ;
+//            }
+//          std::cout << std::endl;
+//          std::cout << std::endl;
+//         }
+//        }
 
         std::vector<std::vector<double>> v4norm(nk_size,
                                                 std::vector<double>(ns * ns * ns));
@@ -2370,5 +2916,60 @@ void ModeAnalysis::print_spectral_function(const unsigned int NT,
     deallocate(self3_real);
 }
 
+// print mode information in mode.in
+void ModeAnalysis::output_mode_information(const int i,
+                                          const int knum,
+                                          const int snum,
+                                          const double omega)
+{
+    std::cout << std::endl;
+    std::cout << " Mode Number : " << std::setw(5) << i + 1 << std::endl;
+    std::cout << "  Phonon at k = (";
+    for (int j = 0; j < 3; ++j) {
+        std::cout << std::setw(10) << std::fixed << dos->kmesh_dos->xk[knum][j];
+        if (j < 2) std::cout << ",";
+    }
+    std::cout << ")" << std::endl;
+    std::cout << "  Mode index = " << std::setw(5) << snum + 1 << std::endl;
+    std::cout << "  Frequency (cm^-1) : "
+              << std::setw(15) << writes->in_kayser(omega) << std::endl;
+}
 
+void ModeAnalysis::output_selfenergy_information(const unsigned int NT,
+                                                 double *T_arr,
+                                                 const unsigned int i, //mode num ( depends on program)
+                                                 const unsigned int knum,
+                                                 const unsigned int snum,
+                                                 const unsigned int nomega, // num of omega 
+                                                 double *omega_array,       // omega list
+                                                 std::complex<double> *selfenergy_array,
+                                                 const std::string prefix) 
+{
+    const auto omega = dos->dymat_dos->get_eigenvalues()[knum][snum]; // phonon frequency for given mode
 
+    std::ofstream ofs_freq_self;
+    std::string file_freq_self = input->job_title + prefix + std::to_string(i + 1);
+    ofs_freq_self.open(file_freq_self.c_str(), std::ios::out);
+    if (!ofs_freq_self) exit("run_mode_analysis", "Cannot open file file_shift");
+
+        ofs_freq_self << "# xk = ";
+        for (int j = 0; j < 3; ++j) {
+            ofs_freq_self << std::setw(15) << dos->kmesh_dos->xk[knum][j];
+        }
+        ofs_freq_self << std::endl;
+        ofs_freq_self << "# mode = " << snum + 1 << std::endl;
+        ofs_freq_self << "## T[K], Freq (cm^-1), omega (cm^-1), Self.real (cm^-1), Self.imag (cm^-1)";
+        ofs_freq_self << std::endl;
+
+        for (int j = 0; j < NT; ++j){
+            for (unsigned int iomega = 0; iomega < nomega; ++iomega) {
+                ofs_freq_self << std::setw(10) << T_arr[j] << std::setw(15) << writes->in_kayser(omega);
+                ofs_freq_self << std::setw(10) << writes->in_kayser(omega_array[iomega])
+                              << std::setw(15) << writes->in_kayser(selfenergy_array[iomega].real())
+                              << std::setw(15) << writes->in_kayser(selfenergy_array[iomega].imag()) << std::endl;
+            }
+        }
+        ofs_freq_self << std::endl;
+        ofs_freq_self.close();
+        std::cout << "  Phonon bubble self-energy is printed in " << file_freq_self << std::endl;
+}

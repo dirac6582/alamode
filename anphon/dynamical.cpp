@@ -1056,6 +1056,10 @@ void Dynamical::project_degenerate_eigenvectors(const double lavec_p[3][3],
                                                 const std::vector<std::vector<double>> &project_directions,
                                                 std::complex<double> **evec_out) const
 {
+    // amano memo 
+    // 
+    // 
+    
     int i, j;
     const auto ns = this->neval;
 

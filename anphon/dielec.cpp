@@ -20,6 +20,7 @@
 #include "parsephon.h"
 #include "phonon_dos.h"
 #include "fcs_phonon.h"
+#include "ewald.h" // add by amano for nonanalytic=3 calculation in mode_analysis.cpp
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -249,16 +250,19 @@ std::vector<std::vector<double>> Dielec::get_zstar_mode() const
     return zstar_mode;
 }
 
+
 void Dielec::compute_mode_effective_charge(std::vector<std::vector<double>> &zstar_mode,
                                            const bool do_normalize) const
 {
     // Compute the effective charges of normal coordinate at q = 0.
 
-    if (dynamical->file_born.empty()) {
-        exitall("Dielec::compute_mode_effective_charge()",
-                "BORNINFO must be set when DIELEC = 1.");
+    if (mympi->my_rank == 0) {
+        if (dynamical->file_born.empty()) {
+            exitall("Dielec::compute_mode_effective_charge()",
+                    "BORNINFO must be set when DIELEC = 1.");
+        }
     }
-
+    
     // If borncharge in dynamical class is not initialized, do it here.
     if (!dynamical->borncharge) {
         const auto verbosity_level = 0;
@@ -281,18 +285,35 @@ void Dielec::compute_mode_effective_charge(std::vector<std::vector<double>> &zst
     std::vector<double> vecs(3);
 
     if (!dynamical->get_projection_directions().empty()) {
+        if (mympi->my_rank == 0) { 
+            std::cout << " DEBUG :: degenerate eigenvectors !! " << "\n";
+        }
         dynamical->project_degenerate_eigenvectors(system->lavec_p,
                                                    fcs_phonon->fc2_ext,
                                                    &xk[0],
                                                    dynamical->get_projection_directions(),
                                                    evec);
     } else {
-        dynamical->eval_k(&xk[0], &xk[0], fcs_phonon->fc2_ext, eval, evec, true);
+        // eval_kというのはnonanalytic=0,1,2の時に有効．
+        // nonanalytic=3の時にはeval_k_ewald関数を利用する必要がある．
+        // 詳細はdynamical.cppのDynamical::get_eigenvalues_dymat関数を参照すること．
+        if (dynamical->nonanalytic == 3) {
+            if (mympi->my_rank == 0) { 
+                std::cout << "CAUTION !! \n" ;
+                std::cout << " we are using nonanalytic=3 calculation for mode effective charge. \n";
+                std::cout << " This is basically meaningless, but sometimes eigenvectors from nonanalytic=3 and others are different.\n";
+                std::cout << " So this setting is useful when you compare results with mode=phonon's. \n";
+                std::cout << "\n";
+            }
+            dynamical->eval_k_ewald(&xk[0], &xk[0], ewald->fc2_without_dipole, eval, evec, true);
+        } else {
+            dynamical->eval_k(&xk[0], &xk[0], fcs_phonon->fc2_ext, eval, evec, true);
+        }
     }
 
     // Divide by sqrt of atomic mass to get normal coordinate
     for (auto i = 0; i < ns; ++i) {
-        for (auto j = 0; j < ns; ++j) {
+        for (auto j = 0; j < ns; ++j) { // amano :: caution !! evec[i][j] represents atom=i/3,cartesian=i%3, mode=j ?
             evec[i][j] /= std::sqrt(system->mass[system->map_p2s[j / 3][0]] / amu_ry);
 //            evec[i][j] /= std::sqrt(system->mass[system->map_p2s[j / 3][0]]);
         }
@@ -307,12 +328,45 @@ void Dielec::compute_mode_effective_charge(std::vector<std::vector<double>> &zst
 
             for (auto j = 0; j < ns; ++j) {
                 zstar_mode[is][i] += zstar_atom[j / 3][i][j % 3] * evec[is][j].real();
-                normalization_factor += std::norm(evec[is][j]);
+                normalization_factor += std::norm(evec[is][j]); // calculate norm of eigenvector(evec)
             }
             if (do_normalize) zstar_mode[is][i] /= std::sqrt(normalization_factor);
         }
     }
 
+    // (for DEBUG) print eigen vectors
+    // causion !! evec[is][j] represents mode=is, atom_id=j/3, cartesian_id=j%3
+    if (mympi->my_rank == 0) { // output .zmode and .strength
+        std::cout << " ns is ... " << ns << "\n";
+        for (auto is = 0; is < ns; ++is) {
+            std::cout << "mode = " << is << "\n";
+            for (auto j = 0; j < ns; ++j) {
+                if (j%3 == 0) std::cout << '\n';
+                // std::cout << std::setw(5) << evec[is][j].real() << std::setw(5) << evec[is][j].real() << std::setw(5) << evec[is][j].real() << '\n';
+                std::cout << std::setw(15) << evec[is][j].real();
+            }
+        }
+    }
     deallocate(eval);
     deallocate(evec);
+}
+
+// add by me
+void Dielec::compute_mode_oscillator_strength(double ***s_born) const
+// calculate mode oscillator strength
+{
+    const auto ns = dynamical->neval;
+
+    // calculate mode effective charge 
+    std::vector<std::vector<double>> zstar_born(ns, std::vector<double>(3));
+    compute_mode_effective_charge(zstar_born, false);
+
+    // calculate mode oscillator strength into s_born
+    for (auto i = 0; i < 3; ++i) {
+        for (auto j = 0; j < 3; ++j) {
+            for (auto is = 0; is < ns; ++is) {
+                s_born[i][j][is] = zstar_born[is][i] * zstar_born[is][j]; // not [i][is] unlike compute_dielectric_function
+            }
+        }
+    }
 }

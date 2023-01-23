@@ -64,7 +64,10 @@ void Fcs_phonon::setup(std::string mode)
         std::cout << " ==============" << std::endl << std::endl;
     }
 
+
     MPI_Bcast(&anharmonic_core->quartic_mode, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&anharmonic_core->flg_4ph, 1, MPI_INT, 0, MPI_COMM_WORLD); // add by me    
+    MPI_Bcast(&anharmonic_core->flg_bubble, 1, MPI_INT, 0, MPI_COMM_WORLD); // add by me    
     MPI_Bcast(&gruneisen->print_gruneisen, 1, MPI_CXX_BOOL, 0, MPI_COMM_WORLD);
     MPI_Bcast(&thermodynamics->calc_FE_bubble, 1, MPI_CXX_BOOL, 0, MPI_COMM_WORLD);
 
@@ -97,6 +100,10 @@ void Fcs_phonon::setup(std::string mode)
             maxorder = 2;
             require_quartic = false;
         }
+    	if (anharmonic_core->flg_4ph > 0){ // add by me
+            maxorder = 3;
+            require_quartic = true;	  
+    	} 
     } else if (mode == "SCPH") {
         require_cubic = true;
         require_quartic = true;

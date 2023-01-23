@@ -45,6 +45,28 @@ public:
                       const std::complex<double> *const *const *evec_in,
                       std::complex<double> *ret) const;
 
+    void selfenergy_a_amano(const unsigned int N,
+                      const double *T,
+                      const unsigned int knum,
+                      const unsigned int snum,
+                      const KpointMeshUniform *kmesh_in,
+                      const double *const *eval_in,
+                      const std::complex<double> *const *const *evec_in,
+                      const unsigned int nomega,
+                      const double *omega,                      
+                      std::complex<double> *ret) const;
+                    
+    // このコードはシンメトリーを使った場合                    
+    // void selfenergy_a_amano(const unsigned int ntemp,
+    //                             const double *temp_in,
+    //                             const double omega_in,
+    //                             const unsigned int ik_in,
+    //                             const unsigned int is_in,
+    //                             const KpointMeshUniform *kmesh_in,
+    //                             const double *const *eval_in,
+    //                             const std::complex<double> *const *const *evec_in,
+    //                             double *ret) const;
+
     void selfenergy_b(const unsigned int N,
                       const double *T,
                       const double omega,
@@ -63,6 +85,18 @@ public:
                       const KpointMeshUniform *kmesh_in,
                       const double *const *eval_in,
                       const std::complex<double> *const *const *evec_in,
+                      std::complex<double> *ret) const;
+
+    // もともとあったconst double omega,を変更してある．
+    void selfenergy_c_amano(const unsigned int N,
+                      const double *T,
+                      const unsigned int knum,
+                      const unsigned int snum,
+                      const KpointMeshUniform *kmesh_in,
+                      const double *const *eval_in,
+                      const std::complex<double> *const *const *evec_in,
+                      const unsigned int nomega,
+                      const double *omega,                      
                       std::complex<double> *ret) const;
 
     void selfenergy_d(const unsigned int N,

@@ -1,0 +1,70 @@
+.SUFFIXES: .h .cpp
+#-----------------------------------------------
+# Makefile for the program 'ANPHON'.
+# Please modify the variables properly.
+# We recommend to use Intel c++ compiler.
+#-----------------------------------------------
+
+# MPICXX = mpicxx 
+# #MPICXX = mpiicpc 
+
+# # add -D_HDF5 to activate HDF5 support
+# CXXFLAGS = -O3 -xHOST -qopenmp -std=c++11
+
+# # when the HDF5 support is activated, 
+# # you may need to add -I$(HDF5_ROOT)/include
+# INCLUDE = -I../include 
+
+# LINKER = ${MPICXX}
+# # when the HDF5 support is activated, 
+# # you may need to add -L$(HDF5_ROOT)/lib -lhdf5_cpp -lhdf5
+# LDFLAGS = -mkl 
+
+#MPICXX = mpicxx
+MPICXX = mpiicpc
+
+# add -D_HDF5 to activate HDF5 support
+CXXFLAGS = -O3 -xHOST -qopenmp -std=c++11
+
+# when the HDF5 support is activated,
+# you may need to add -I$(HDF5_ROOT)/include
+INCLUDE = -I../include  -I$(HOME)/include -I$(SPGLIB_ROOT)/include -I/home/k0151/k015124/src/eigen-3.4.0 -I/home/k0151/k015124/src/eigen-3.4.0/Eigen -I/home/local/intel/mkl/include/fftw -I/home/k0151/k015124/src/boost_1_78_0/
+
+LINKER = ${MPICXX}
+# when the HDF5 support is activated,
+# you may need to add -L$(HDF5_ROOT)/lib -lhdf5_cpp -lhdf5
+LDFLAGS = -mkl
+
+
+LAPACK = 
+LIBS = ${LAPACK}
+
+#----------------------------------------------
+# General rules
+#----------------------------------------------
+
+.cpp.o:
+	${MPICXX} ${CXXFLAGS} ${INCLUDE} -c $<
+
+PROG = anphon
+
+CXXSRC = $(wildcard *.cpp)
+
+OBJS= ${CXXSRC:.cpp=.o}
+
+default: anphon
+
+all: ${PROG}
+
+anphon: ${OBJS}
+	${LINKER} ${LDFLAGS} -o $@ ${OBJS} ${LIBS}
+
+clean:
+	rm -f ${OBJS}
+
+.PHONY: clean
+
+depend:
+	gcc -MM *.cpp > .depend
+
+-include .depend
