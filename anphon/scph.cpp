@@ -139,13 +139,15 @@ void Scph::setup_scph()
 
 void Scph::exec_scph()
 {
-    const auto ns = dynamical->neval;
+    const auto ns = dynamical->neval; // コード全体で使われるnsはフォノンのモード数を表す
     const auto Tmin = system->Tmin;
     const auto Tmax = system->Tmax;
     const auto dT = system->dT;
 
     std::complex<double> ****delta_dymat_scph = nullptr;
     std::complex<double> ****delta_dymat_scph_plus_bubble = nullptr;
+
+    std::complex<double> ****delta_dymat_scph_plus_bubble_plus_loop = nullptr; // bubble+loop用
 
     const auto NT = static_cast<unsigned int>((Tmax - Tmin) / dT) + 1;
 
@@ -160,7 +162,7 @@ void Scph::exec_scph()
         // Read anharmonic correction to the dynamical matrix from the existing file
         load_scph_dymat_from_file(delta_dymat_scph);
 
-    } else if (only_v4) {
+    } else if (only_v4) { // now not using
         if (dynamical->nonanalytic == 3) {
             exit("exec_scph",
                  "Sorry, NONANALYTIC=3 can't be used for the main loop of the SCPH calculation.");
@@ -169,6 +171,18 @@ void Scph::exec_scph()
         // Only calculate V4 array. mostly for debugging
         exec_scph_only_V4(delta_dymat_scph);
 
+    } else if (new_scph) { // ここに実装していく
+        if (dynamical->nonanalytic == 3) {
+            exit("exec_scph",
+                 "Sorry, NONANALYTIC=3 can't be used for the main loop of the SCPH calculation.");
+        }
+        // new scph calculation
+        exec_new_scph(delta_dymat_scph);
+
+        if (mympi->my_rank == 0) {
+            store_scph_dymat_to_file(delta_dymat_scph);
+            write_anharmonic_correction_fc2(delta_dymat_scph, NT);
+        }
     } else {
 
         if (dynamical->nonanalytic == 3) {
@@ -176,11 +190,14 @@ void Scph::exec_scph()
                  "Sorry, NONANALYTIC=3 can't be used for the main loop of the SCPH calculation.");
         }
         // Solve the SCPH equation and obtain the correction to the dynamical matrix
+        // ここで大事なのは，ここで計算されるdelta_dymat_scphもharmonicに対するcorrection
+        // になっていること．従って，全ての計算の入出力をharmonicに対するcorrectionのDynamical Matrix
+        // とすることによって一貫した計算が可能である．
         exec_scph_main(delta_dymat_scph);
 
         if (mympi->my_rank == 0) {
-            store_scph_dymat_to_file(delta_dymat_scph);
-            write_anharmonic_correction_fc2(delta_dymat_scph, NT);
+            store_scph_dymat_to_file(delta_dymat_scph); 
+            write_anharmonic_correction_fc2(delta_dymat_scph, NT); // 
         }
     }
 
@@ -192,7 +209,7 @@ void Scph::exec_scph()
             }
         }
 
-        if (bubble) {
+        if (!new_scph && bubble) { //bubble=1,2,3の時はこれ！
             allocate(delta_dymat_scph_plus_bubble, NT, ns, ns, kmesh_coarse->nk);
             bubble_correction(delta_dymat_scph,
                               delta_dymat_scph_plus_bubble);
@@ -201,6 +218,29 @@ void Scph::exec_scph()
             }
         }
 
+        /*
+        new_scph calculation :: 
+        */
+        if (new_scph && bubble){ // new_scphの時はこれ！！
+            // 1回目のbubble correction
+            allocate(delta_dymat_scph_plus_bubble, NT, ns, ns, kmesh_coarse->nk);
+            bubble_correction_new_scph(delta_dymat_scph,
+                              delta_dymat_scph_plus_bubble);
+            if (mympi->my_rank == 0) {
+                write_anharmonic_correction_fc2(delta_dymat_scph_plus_bubble, NT, bubble);
+            }
+
+            // 1回目のbbble correctionの結果を利用して，loop correctionを計算する．
+            allocate(delta_dymat_scph_plus_bubble_plus_loop, NT, ns, ns, kmesh_coarse->nk);
+            loop_correction_new_scph(delta_dymat_scph_plus_bubble,
+                              delta_dymat_scph_plus_bubble_plus_loop);
+            // TODO :: 多分だけど，ここでdelta_dymat_scph_plus_bubbleとdelta_dymat_scph_plus_bubble_plus_loopを
+            // TODO :: 足し合わせないとまずいんじゃない？
+            // → いや，多分そんなことないと思う．
+            if (mympi->my_rank == 0) {
+                write_anharmonic_correction_fc2(delta_dymat_scph_plus_bubble_plus_loop, NT, 4); //type=4で出力ファイル名を変更
+            }
+        }
         postprocess(delta_dymat_scph,
                     delta_dymat_scph_plus_bubble);
     }
@@ -212,6 +252,9 @@ void Scph::exec_scph()
 void Scph::postprocess(std::complex<double> ****delta_dymat_scph,
                        std::complex<double> ****delta_dymat_scph_plus_bubble)
 {
+    /*
+    SCPH計算後にfree energy, MSD, DOSの計算を行う．
+    */
     double ***eval_anharm = nullptr;
     const auto ns = dynamical->neval;
     const auto Tmin = system->Tmin;
@@ -942,6 +985,143 @@ void Scph::exec_scph_only_V4(std::complex<double> ****dymat_anharm)
 
     deallocate(v4_array_all);
 }
+
+void Scph::exec_new_scph(std::complex<double> ****dymat_anharm)
+{
+    /*
+    new_scph計算用のscphコード．loop correctionの計算を行うところが特徴．
+
+    */
+    int ik, is;
+    const auto nk = kmesh_dense->nk;
+    const auto ns = dynamical->neval;
+    const auto nk_irred_interpolate = kmesh_coarse->nk_irred;
+    const auto Tmin = system->Tmin;
+    const auto Tmax = system->Tmax;
+    const auto dT = system->dT;
+    double ***omega2_anharm;
+    std::complex<double> ***evec_anharm_tmp;
+    std::complex<double> ***v3_array_all;
+    std::complex<double> ***v4_array_all;
+
+    std::vector<double> vec_temp;
+
+    const auto NT = static_cast<unsigned int>((Tmax - Tmin) / dT) + 1;
+
+    if (mympi->my_rank == 0) { 
+        std::cout << " --------------------------- \n" ;        
+        std::cout << "  NEW SCPH calculation       \n" ;
+        std::cout << "     ( NEW_SCPH = 1)         \n" ;
+        std::cout << " --------------------------- \n" ;
+    }
+
+
+    // Compute matrix element of 4-phonon interaction
+
+    allocate(omega2_anharm, NT, nk, ns);
+    allocate(evec_anharm_tmp, nk, ns, ns);
+    allocate(v4_array_all, nk_irred_interpolate * nk,
+             ns * ns, ns * ns); //割り当ての形はv4_arrayと同じに見える．最初がQ点，その後のns2,ns2がそれぞれブランチインデックス2つづつを表す．
+
+    // Calculate v4 array.
+    // This operation is the most expensive part of the calculation.
+    if (selfenergy_offdiagonal & (ialgo == 1)) {
+        compute_V4_elements_mpi_over_band(v4_array_all,
+                                          evec_harmonic,
+                                          selfenergy_offdiagonal);
+    } else {
+        compute_V4_elements_mpi_over_kpoint(v4_array_all,
+                                            evec_harmonic,
+                                            selfenergy_offdiagonal,
+                                            relax_coordinate);
+    }
+
+    if (relax_coordinate) {
+        allocate(v3_array_all, nk, ns, ns * ns);
+        compute_V3_elements_mpi_over_kpoint(v3_array_all,
+                                            evec_harmonic,
+                                            selfenergy_offdiagonal);
+    }
+
+    if (mympi->my_rank == 0) {
+
+        std::complex<double> ***cmat_convert;
+        allocate(cmat_convert, nk, ns, ns);
+
+        vec_temp.clear(); // 温度のリスト
+
+        if (lower_temp) {
+            for (int i = NT - 1; i >= 0; --i) {
+                vec_temp.push_back(Tmin + static_cast<double>(i) * dT);
+            }
+        } else {
+            for (int i = 0; i < NT; ++i) {
+                vec_temp.push_back(Tmin + static_cast<double>(i) * dT);
+            }
+        }
+
+        auto converged_prev = false;
+
+        for (double temp: vec_temp) { // vec_tempに入った温度についてのループ
+            auto iT = static_cast<unsigned int>((temp - Tmin) / dT);
+
+            // Initialize phonon eigenvectors with harmonic values
+
+            for (ik = 0; ik < nk; ++ik) {
+                for (is = 0; is < ns; ++is) {
+                    for (int js = 0; js < ns; ++js) {
+                        evec_anharm_tmp[ik][is][js] = evec_harmonic[ik][is][js];
+                    }
+                }
+            }
+            if (converged_prev) {
+                if (lower_temp) {
+                    for (ik = 0; ik < nk; ++ik) {
+                        for (is = 0; is < ns; ++is) {
+                            omega2_anharm[iT][ik][is] = omega2_anharm[iT + 1][ik][is];
+                        }
+                    }
+                } else {
+                    for (ik = 0; ik < nk; ++ik) {
+                        for (is = 0; is < ns; ++is) {
+                            omega2_anharm[iT][ik][is] = omega2_anharm[iT - 1][ik][is];
+                        }
+                    }
+                }
+            }
+            /*
+            非調和フォノンの振動数を計算するメインのアルゴリズム．
+            SCPH方程式をiterativeに解いている．
+            */ 
+            compute_anharmonic_frequency(v4_array_all,
+                                         omega2_anharm[iT],
+                                         evec_anharm_tmp,
+                                         temp,
+                                         converged_prev,
+                                         cmat_convert,
+                                         selfenergy_offdiagonal,
+                                         writes->getVerbosity());
+
+            calc_new_dymat_with_evec(dymat_anharm[iT],
+                                     omega2_anharm[iT],
+                                     evec_anharm_tmp);
+
+            if (!warmstart_scph) converged_prev = false;
+        }
+
+        deallocate(cmat_convert);
+
+    }
+
+    mpi_bcast_complex(dymat_anharm, NT, kmesh_coarse->nk, ns);
+
+    deallocate(omega2_anharm);
+    deallocate(v4_array_all);
+    deallocate(evec_anharm_tmp);
+}
+
+
+
 
 
 void Scph::compute_V3_elements_mpi_over_kpoint(std::complex<double> ***v3_out,
@@ -1701,7 +1881,7 @@ void Scph::setup_transform_symmetry()
     double x1[3], x2[3], k[3], k_minus[3], Sk[3], xtmp[3];
     double S_cart[3][3], S_frac[3][3], S_frac_inv[3][3];
     double S_recip[3][3];
-    std::complex<double> im(0.0, 1.0);
+    std::complex<double> im(0.0, 1.0); //純虚数の定義
     std::complex<double> **gamma_tmp;
     bool *flag;
 
@@ -2315,6 +2495,9 @@ void Scph::calc_new_dymat_with_evec(std::complex<double> ***dymat_out,
                                     double **omega2_in,
                                     std::complex<double> ***evec_in)
 {
+    // amano::ここで新しいdymatを計算している？
+    // amano::最後にharmonic部分を引き算してしまいるが，これはfc2_phononから直接計算している．
+    // amano::従って，入力に関わらずいかなるときも調和IFCとomega_in, evec_inとの差が出力される．
     std::complex<double> *polarization_matrix, *mat_tmp;
     std::complex<double> *eigval_matrix, *dmat;
     std::complex<double> *beta;
@@ -2457,6 +2640,7 @@ void Scph::calc_new_dymat_with_evec(std::complex<double> ***dymat_out,
 
     deallocate(dymat_q);
 }
+
 
 void Scph::compute_anharmonic_frequency(std::complex<double> ***v4_array_all,
                                         double **omega2_out,
@@ -3061,6 +3245,334 @@ void Scph::compute_free_energy_bubble_SCPH(const unsigned int kmesh[3],
     }
 }
 
+
+void Scph::loop_correction_new_scph(std::complex<double> ****delta_dymat_scph,
+                             std::complex<double> ****delta_dymat_scph_plus_bubble)
+{
+    // amano :: bubbleではなく，loopのcorrectionを行う部分をこっちに作成する．
+
+    const auto NT = static_cast<unsigned int>((system->Tmax - system->Tmin) / system->dT) + 1;
+    const auto ns = dynamical->neval;
+
+    auto epsilon = integration->epsilon;
+    const auto nk_irred_interpolate = kmesh_coarse->nk_irred;
+    const auto nk_scph = kmesh_dense->nk;
+
+    double **eval = nullptr;
+    double ***eval_loop = nullptr;
+    std::complex<double> ***evec;
+    double *real_self = nullptr;
+    std::vector<std::complex<double>> omegalist; //これを何に使っているのか？
+
+    if (mympi->my_rank == 0) {
+        std::cout << std::endl;
+        std::cout << " -----------------------------------------------------------------"
+                  << std::endl;
+        std::cout << " Calculating the loop self-energy for NEW_SCPH calculation " << std::endl;
+        std::cout << " on top of the SCPH calculation." << std::endl;
+        std::cout << '\n';
+    }
+
+    allocate(eval, nk_scph, ns);
+    allocate(evec, nk_scph, ns, ns);
+
+    if (mympi->my_rank == 0) {
+        allocate(eval_loop, NT, nk_scph, ns);
+        for (auto iT = 0; iT < NT; ++iT) {
+            for (auto ik = 0; ik < nk_scph; ++ik) {
+                for (auto is = 0; is < ns; ++is) {
+                    eval_loop[iT][ik][is] = 0.0;
+                }
+            }
+        }
+        allocate(real_self, ns);
+    }
+
+    std::vector<int> *degeneracy_at_k;
+    allocate(degeneracy_at_k, nk_scph);
+
+    for (auto iT = 0; iT < NT; ++iT) {
+        const auto temp = system->Tmin + system->dT * float(iT);
+
+        exec_interpolation(kmesh_interpolate,
+                           delta_dymat_scph[iT],
+                           nk_scph,
+                           kmesh_dense->xk,
+                           kmesh_dense->kvec_na,
+                           eval,
+                           evec);
+
+        find_degeneracy(degeneracy_at_k,
+                        nk_scph,
+                        eval);
+
+        if (mympi->my_rank == 0) std::cout << " Temperature (K) : " << std::setw(6) << temp << '\n';
+
+        for (auto ik = 0; ik < nk_irred_interpolate; ++ik) {
+
+            auto knum_interpolate = kmesh_coarse->kpoint_irred_all[ik][0].knum;
+            auto knum = kmap_interpolate_to_scph[knum_interpolate];
+
+            if (mympi->my_rank == 0) {
+                std::cout << "  Irred. k: " << std::setw(5) << ik + 1 << " (";
+                for (auto m = 0; m < 3; ++m) std::cout << std::setw(15) << kmesh_dense->xk[knum][m];
+                std::cout << ")\n";
+            }
+
+            for (unsigned int snum = 0; snum < ns; ++snum) {
+
+                if (eval[knum][snum] < eps8) {
+                    if (mympi->my_rank == 0) real_self[snum] = 0.0; //固有値が小さい（Γ点音響フォノン）なら無視．
+                } else {
+                    omegalist.clear();
+
+                    if (bubble == 1) { // bubble=1の場合（Loopの場合は関係ないが，分かりやすさのために残しておく．）
+
+                        omegalist.push_back(im * epsilon); //i*epsilon(無限小の虚数のこと) 
+
+                        auto se_bubble = get_loop_selfenergy(kmesh_dense,
+                                                               ns,
+                                                               eval,
+                                                               evec,
+                                                               knum,
+                                                               snum,
+                                                               temp);
+                                                               // omegalist);
+
+                        if (mympi->my_rank == 0) real_self[snum] = se_bubble[0].real();
+
+                    } 
+                }
+                if (mympi->my_rank == 0) {
+                    std::cout << "   branch : " << std::setw(5) << snum + 1;
+                    std::cout << " omega (SC1_loop) = " << std::setw(15) << writes->in_kayser(eval[knum][snum])
+                              << " (cm^-1); ";
+                    std::cout << " Re[Self] = " << std::setw(15) << writes->in_kayser(real_self[snum]) << " (cm^-1)\n";
+                }
+            }
+
+            if (mympi->my_rank == 0) {
+                // average self energy of degenerate modes
+                int ishift = 0;
+                double real_self_avg = 0.0;
+
+                for (const auto &it: degeneracy_at_k[knum]) {
+                    for (auto m = 0; m < it; ++m) {
+                        real_self_avg += real_self[m + ishift];
+                    }
+                    real_self_avg /= static_cast<double>(it);
+
+                    for (auto m = 0; m < it; ++m) {
+                        real_self[m + ishift] = real_self_avg;
+                    }
+                    real_self_avg = 0.0;
+                    ishift += it;
+                }
+
+                for (unsigned int snum = 0; snum < ns; ++snum) { //branchに関するループ
+                    eval_loop[iT][knum][snum] = eval[knum][snum] * eval[knum][snum]
+                                                  - 2.0 * eval[knum][snum] * real_self[snum]; //G関数の分母から次の振動数を計算
+                    for (auto jk = 1; jk < kmesh_coarse->kpoint_irred_all[ik].size(); ++jk) {
+                        auto knum2 = kmap_interpolate_to_scph[kmesh_coarse->kpoint_irred_all[ik][jk].knum];
+                        eval_loop[iT][knum2][snum] = eval_loop[iT][knum][snum]; //k点に関して置き換えている？
+                    }
+                }
+
+                std::cout << '\n';
+            }
+        }
+
+        if (mympi->my_rank == 0) {
+            // 固有ベクトルを計算できたら，そこからdynamical_matrixを計算
+            //    Anharmonic dynamical matrix calculated on the 𝑘
+            //    grid defined by the KMESH_INTERPOLATE tag. 
+            //    This file is used to restart the SCPH calculation.
+
+            // ちなみにちゃんと保存もしてくれるっぽい．
+
+            std::cout << " loop-correctionが終了： 1回目 : \n" ;
+            calc_new_dymat_with_evec(delta_dymat_scph_plus_bubble[iT],
+                                     eval_loop[iT],
+                                     evec);
+        }
+    }
+
+    deallocate(eval);
+    deallocate(evec);
+    deallocate(degeneracy_at_k);
+
+    if (eval_loop) deallocate(eval_loop);
+
+    if (mympi->my_rank == 0) {
+        std::cout << " Loop correction for NEW_SCPH done!" << std::endl << std::endl;
+    }
+}
+
+
+void Scph::bubble_correction_new_scph(std::complex<double> ****delta_dymat_scph,
+                             std::complex<double> ****delta_dymat_scph_plus_bubble)
+{
+    // amano :: コード本体を弄らないで済むように，bubble_correctionをこちらへ．
+    //  
+    // 
+    const auto NT = static_cast<unsigned int>((system->Tmax - system->Tmin) / system->dT) + 1;
+    const auto ns = dynamical->neval;
+
+    auto epsilon = integration->epsilon;
+    const auto nk_irred_interpolate = kmesh_coarse->nk_irred;
+    const auto nk_scph = kmesh_dense->nk;
+
+    double **eval = nullptr;
+    double ***eval_bubble = nullptr;
+    std::complex<double> ***evec;
+    double *real_self = nullptr;
+    std::vector<std::complex<double>> omegalist;
+
+    if (mympi->my_rank == 0) {
+        std::cout << std::endl;
+        std::cout << " -----------------------------------------------------------------"
+                  << std::endl;
+        std::cout << " Calculating the bubble self-energy for NEW_SCPH calculation " << std::endl;
+        std::cout << " on top of the SCPH calculation." << std::endl;
+        std::cout << '\n';
+    }
+
+    allocate(eval, nk_scph, ns);
+    allocate(evec, nk_scph, ns, ns);
+
+    if (mympi->my_rank == 0) {
+        allocate(eval_bubble, NT, nk_scph, ns);
+        for (auto iT = 0; iT < NT; ++iT) {
+            for (auto ik = 0; ik < nk_scph; ++ik) {
+                for (auto is = 0; is < ns; ++is) {
+                    eval_bubble[iT][ik][is] = 0.0;
+                }
+            }
+        }
+        allocate(real_self, ns);
+    }
+
+    std::vector<int> *degeneracy_at_k;
+    allocate(degeneracy_at_k, nk_scph);
+
+    for (auto iT = 0; iT < NT; ++iT) {
+        const auto temp = system->Tmin + system->dT * float(iT);
+
+        exec_interpolation(kmesh_interpolate,
+                           delta_dymat_scph[iT],
+                           nk_scph,
+                           kmesh_dense->xk,
+                           kmesh_dense->kvec_na,
+                           eval,
+                           evec);
+
+        find_degeneracy(degeneracy_at_k,
+                        nk_scph,
+                        eval);
+
+        if (mympi->my_rank == 0) std::cout << " Temperature (K) : " << std::setw(6) << temp << '\n';
+
+        for (auto ik = 0; ik < nk_irred_interpolate; ++ik) {
+
+            auto knum_interpolate = kmesh_coarse->kpoint_irred_all[ik][0].knum;
+            auto knum = kmap_interpolate_to_scph[knum_interpolate];
+
+            if (mympi->my_rank == 0) {
+                std::cout << "  Irred. k: " << std::setw(5) << ik + 1 << " (";
+                for (auto m = 0; m < 3; ++m) std::cout << std::setw(15) << kmesh_dense->xk[knum][m];
+                std::cout << ")\n";
+            }
+
+            for (unsigned int snum = 0; snum < ns; ++snum) {
+
+                if (eval[knum][snum] < eps8) {
+                    if (mympi->my_rank == 0) real_self[snum] = 0.0; //固有値が小さい（Γ点音響フォノン）なら無視．
+                } else {
+                    omegalist.clear();
+
+                    if (bubble == 1) { // bubble=1の場合，
+
+                        omegalist.push_back(im * epsilon);
+
+                        auto se_bubble = get_bubble_selfenergy(kmesh_dense,
+                                                               ns,
+                                                               eval,
+                                                               evec,
+                                                               knum,
+                                                               snum,
+                                                               temp,
+                                                               omegalist);
+
+                        if (mympi->my_rank == 0) real_self[snum] = se_bubble[0].real();
+
+                    } 
+                }
+                if (mympi->my_rank == 0) {
+                    std::cout << "   branch : " << std::setw(5) << snum + 1;
+                    std::cout << " omega (SC1) = " << std::setw(15) << writes->in_kayser(eval[knum][snum])
+                              << " (cm^-1); ";
+                    std::cout << " Re[Self] = " << std::setw(15) << writes->in_kayser(real_self[snum]) << " (cm^-1)\n";
+                }
+            }
+
+            if (mympi->my_rank == 0) {
+                // average self energy of degenerate modes
+                int ishift = 0;
+                double real_self_avg = 0.0;
+
+                for (const auto &it: degeneracy_at_k[knum]) {
+                    for (auto m = 0; m < it; ++m) {
+                        real_self_avg += real_self[m + ishift];
+                    }
+                    real_self_avg /= static_cast<double>(it);
+
+                    for (auto m = 0; m < it; ++m) {
+                        real_self[m + ishift] = real_self_avg;
+                    }
+                    real_self_avg = 0.0;
+                    ishift += it;
+                }
+
+                for (unsigned int snum = 0; snum < ns; ++snum) { //branchに関するループ
+                    eval_bubble[iT][knum][snum] = eval[knum][snum] * eval[knum][snum]
+                                                  - 2.0 * eval[knum][snum] * real_self[snum];
+                    for (auto jk = 1; jk < kmesh_coarse->kpoint_irred_all[ik].size(); ++jk) {
+                        auto knum2 = kmap_interpolate_to_scph[kmesh_coarse->kpoint_irred_all[ik][jk].knum];
+                        eval_bubble[iT][knum2][snum] = eval_bubble[iT][knum][snum]; //k点に関して置き換えている？
+                    }
+                }
+
+                std::cout << '\n';
+            }
+        }
+
+        if (mympi->my_rank == 0) {
+            // 固有ベクトルを計算できたら，そこからdynamical_matrixを計算
+            //    Anharmonic dynamical matrix calculated on the 𝑘
+            //    grid defined by the KMESH_INTERPOLATE tag. 
+            //    This file is used to restart the SCPH calculation.
+
+            // ちなみにちゃんと保存もしてくれるっぽい．
+
+            std::cout << " bubble-correctionが終了： 1回目 : \n" ;
+            calc_new_dymat_with_evec(delta_dymat_scph_plus_bubble[iT],
+                                     eval_bubble[iT],
+                                     evec);
+        }
+    }
+
+    deallocate(eval);
+    deallocate(evec);
+    deallocate(degeneracy_at_k);
+
+    if (eval_bubble) deallocate(eval_bubble);
+
+    if (mympi->my_rank == 0) {
+        std::cout << " bubble=1 correction for NEW_SCPH done!" << std::endl << std::endl;
+    }
+}
+
+
 void Scph::bubble_correction(std::complex<double> ****delta_dymat_scph,
                              std::complex<double> ****delta_dymat_scph_plus_bubble)
 {
@@ -3139,7 +3651,7 @@ void Scph::bubble_correction(std::complex<double> ****delta_dymat_scph,
                 } else {
                     omegalist.clear();
 
-                    if (bubble == 1) {
+                    if (bubble == 1) { // bubble=1の場合，
 
                         omegalist.push_back(im * epsilon);
 
@@ -3374,7 +3886,7 @@ std::vector<std::complex<double>> Scph::get_bubble_selfenergy(const KpointMeshUn
             f1 = n1 + n2 + 1.0;
             f2 = n2 - n1;
         }
-        for (auto iomega = 0; iomega < nomega; ++iomega) {
+        for (auto iomega = 0; iomega < nomega; ++iomega) { //振動数omegaに依存する部分をこのomegalistで計算している
             omega_sum[0] = 1.0 / (omegalist[iomega] + omega1 + omega2) - 1.0 / (omegalist[iomega] - omega1 - omega2);
             omega_sum[1] = 1.0 / (omegalist[iomega] + omega1 - omega2) - 1.0 / (omegalist[iomega] - omega1 + omega2);
             ret_mpi[iomega] += v3_tmp * (f1 * omega_sum[0] + f2 * omega_sum[1]);
@@ -3395,6 +3907,135 @@ std::vector<std::complex<double>> Scph::get_bubble_selfenergy(const KpointMeshUn
 
     return se_bubble;
 }
+
+
+
+std::vector<std::complex<double>> Scph::get_loop_selfenergy(const KpointMeshUniform *kmesh_in,
+                                                              const unsigned int ns_in,
+                                                              const double *const *eval_in,
+                                                              const std::complex<double> *const *const *evec_in,
+                                                              const unsigned int knum,
+                                                              const unsigned int snum,
+                                                              const double temp_in)
+                                                            //  const std::vector<std::complex<double>> &omegalist)
+                                                            // Loopは振動数に依存しないので，多分omegalistはいらない
+{
+    // amano :: get_bubble_selfenergyに対応して，loop自己エネルギーを計算する．
+    // 参考にしているのは
+    //   get_bubble_selfenergy
+    //   selfenergy->selfenergy_b
+
+    /*
+    const KpointMeshUniform *kmesh_in, :: inputから計算されるkmesh
+    const unsigned int ns_in,          :: ns=dynamical->neval(フォノンモード数)を表している
+    const double *const *eval_in,      :: harmonicの振動数リスト
+    const std::complex<double> *const *const *evec_in, :: harmonicの固有ベクトルリスト
+    const unsigned int knum, :: k点の指定のため？
+    const unsigned int snum, :: k点の指定のため ?
+    const double temp_in,    :: 温度のリスト
+    const std::vector<std::complex<double>> &omegalist :: 振動数のリスト？必要性が不明
+    */
+    
+    unsigned int arr_quartic[4]; // selfenergy_bから移植
+
+    unsigned int arr_cubic[3];
+    double xk_tmp[3];
+    std::complex<double> omega_sum[2];
+
+    double factor = -1.0 / (static_cast<double>(kmesh_in->nk) * std::pow(2.0, 3)); // selfenergy_bを参考に編集
+    const auto ns2 = ns_in * ns_in; 
+    const auto nks = kmesh_in->nk * ns2; // bubbleとちがって1重ループで良いので，nks=nk*ns_inで良いはず．
+    const auto nks_amano = kmesh_in->nk * ns_in;// 多分これでok？
+
+    double n1;
+
+    // bubbleの時には使ってた
+    // auto knum_minus = kmesh_in->kindex_minus_xk[knum];
+    // arr_cubic[0] = ns_in * knum_minus + snum;
+    
+    arr_quartic[0] = ns_in * kmesh_in->kindex_minus_xk[knum] + snum; // selfenergy_bからcopy
+    arr_quartic[3] = ns_in * knum + snum; // selfenergy_bからcopy
+
+    //    std::vector<std::complex<double>> se_bubble(omegalist.size()); bubbleの場合はomegalistを使っていた
+    std::vector<std::complex<double>> se_bubble(1); // loopの場合は一つの値だけ！
+
+    // const auto nomega = omegalist.size(); //これはなに？(計算するomegaの数?)
+    const auto nomega = 1; // 振動数依存性がないので計算する数は1つで良いはず．
+
+
+    std::complex<double> *ret_sum, *ret_mpi;
+    allocate(ret_sum, nomega);
+    allocate(ret_mpi, nomega);
+
+    for (auto iomega = 0; iomega < nomega; ++iomega) { //0で初期化
+        ret_sum[iomega] = std::complex<double>(0.0, 0.0);
+        ret_mpi[iomega] = std::complex<double>(0.0, 0.0);
+    }
+
+    // for (auto iks = mympi->my_rank; iks < nks; iks += mympi->nprocs) {
+    for (auto iks = mympi->my_rank; iks < nks_amano; iks += mympi->nprocs) {
+
+        // bubbleの時の定義
+        //auto ik1 = iks / ns2;
+        //auto is1 = (iks % ns2) / ns_in;
+        // auto is2 = iks % ns_in;
+
+        // nks_amano = nk * ns_inを使う場合は，ikはnsで割った商，isはnsで割ったあまりとすればokだと思う．
+        // 元のnksは二つのq1,q2に対応したループになっているためにちょっと特殊になっている．
+        auto ik1 = iks / ns_in;
+        auto is1 = iks % ns_in;
+
+
+        // bubbleでは使ってたけど使わない
+        //for (auto m = 0; m < 3; ++m) xk_tmp[m] = kmesh_in->xk[knum][m] - kmesh_in->xk[ik1][m];
+        //auto ik2 = kmesh_in->get_knum(xk_tmp);
+
+        double omega1 = eval_in[ik1][is1];
+        // double omega2 = eval_in[ik2][is2]; //使ってない
+
+        // bubbleの時に使ってたやつ
+        // arr_cubic[1] = ns_in * ik1 + is1;
+        // arr_cubic[2] = ns_in * ik2 + is2;
+
+
+        arr_quartic[1] = ns_in * ik1 + is1; // selfenergy_bからcopy
+        arr_quartic[2] = ns_in * kmesh_in->kindex_minus_xk[ik1] + is1; // selfenergy_bからcopy
+
+        // bubbleの時には使ってたやつ
+        // double v3_tmp = std::norm(anharmonic_core->V3(arr_cubic,
+        //                                               kmesh_in->xk,
+        //                                               eval_in,
+        //                                               evec_in,
+        //                                               phase_factor_scph));
+
+        std::complex<double> v4_tmp = anharmonic_core->V4(arr_quartic); // selfenergy_bからcopy
+
+        if (thermodynamics->classical) { //omega1を使って分布関数を計算
+            n1 = thermodynamics->fC(omega1, temp_in); 
+        } else {
+            n1 = thermodynamics->fB(omega1, temp_in);
+        }
+        for (auto iomega = 0; iomega < nomega; ++iomega) { //ret_mpiの形を維持するためにこうしているだけ
+            ret_mpi[iomega] += v4_tmp * (2.0 * n1 + 1.0);
+        }
+    }
+    for (auto iomega = 0; iomega < nomega; ++iomega) {
+        ret_mpi[iomega] *= factor;
+    }
+
+    MPI_Reduce(&ret_mpi[0], &ret_sum[0], nomega, MPI_COMPLEX16, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    for (auto iomega = 0; iomega < nomega; ++iomega) {
+        se_bubble[iomega] = ret_sum[iomega];
+    }
+
+    deallocate(ret_mpi);
+    deallocate(ret_sum);
+
+    return se_bubble;
+}
+
+
 
 double Scph::distance(double *x1,
                       double *x2)
@@ -3447,6 +4088,10 @@ void Scph::write_anharmonic_correction_fc2(std::complex<double> ****delta_dymat,
                                            const unsigned int NT,
                                            const int type)
 {
+    /*
+    最後にanharmonic correctionのファイルを作成する．
+    typeに応じてファイル名を変更する．
+    */
     unsigned int i, j;
     const auto Tmin = system->Tmin;
     const auto dT = system->dT;
@@ -3467,6 +4112,8 @@ void Scph::write_anharmonic_correction_fc2(std::complex<double> ****delta_dymat,
         file_fc2 = input->job_title + ".scph+bubble(w)_dfc2";
     } else if (type == 3) {
         file_fc2 = input->job_title + ".scph+bubble(wQP)_dfc2";
+    } else if (type == 4) { // add by amano
+        file_fc2 = input->job_title + ".scph+bubble(0)+loop_dfc2";
     }
 
     ofs_fc2.open(file_fc2.c_str(), std::ios::out);
@@ -3575,6 +4222,8 @@ void Scph::write_anharmonic_correction_fc2(std::complex<double> ****delta_dymat,
         std::cout << " : Anharmonic corrections to the second-order IFCs (SCPH+Bubble(w))" << std::endl;
     } else if (type == 3) {
         std::cout << " : Anharmonic corrections to the second-order IFCs (SCPH+Bubble(wQP))" << std::endl;
+    } else if (type == 4) { // amano
+        std::cout << " : Anharmonic corrections to the second-order IFCs (SCPH+Bubble(0)+loop)" << std::endl;
     }
 }
 

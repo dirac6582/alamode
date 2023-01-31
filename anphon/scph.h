@@ -67,6 +67,7 @@ public:
     bool warmstart_scph;
     bool lower_temp; // LOWER_TEMP(input)
     bool only_v4;    // ONLY_V4(input) add by amano
+    bool new_scph;    // NEW_SCPH(input) add by amano
     double tolerance_scph;
 
     void exec_scph();
@@ -123,6 +124,8 @@ private:
     void store_scph_dymat_to_file(const std::complex<double> *const *const *const *dymat_in);
 
     void exec_scph_main(std::complex<double> ****);
+
+    void exec_new_scph(std::complex<double> ****); // add by amano
 
     void exec_scph_only_V4(std::complex<double> ****); // add by amano
 
@@ -216,6 +219,17 @@ private:
     void bubble_correction(std::complex<double> ****,
                            std::complex<double> ****);
 
+    // amano :: for new scph calculation
+    void bubble_correction_new_scph(std::complex<double> ****, 
+                           std::complex<double> ****);
+
+
+    // amano :: for new scph calculation
+    // 2回目以降のLoopの計算は通常の摂動論と同じ
+    void loop_correction_new_scph(std::complex<double> ****, 
+                           std::complex<double> ****);
+
+
     std::vector<std::complex<double>> get_bubble_selfenergy(const KpointMeshUniform *kmesh_in,
                                                             const unsigned int ns_in,
                                                             const double *const *eval_in,
@@ -225,7 +239,20 @@ private:
                                                             const double temp_in,
                                                             const std::vector<std::complex<double>> &omegalist);
 
+
+    // amano :: for new scph calculation
+    // get_bubble_selfenergyに対応して，loopを実装する部分．
+    std::vector<std::complex<double>> get_loop_selfenergy(const KpointMeshUniform *kmesh_in,
+                                                            const unsigned int ns_in,
+                                                            const double *const *eval_in,
+                                                            const std::complex<double> *const *const *evec_in,
+                                                            const unsigned int knum,
+                                                            const unsigned int snum,
+                                                            const double temp_in);
+
 };
+
+
 
 extern "C" {
 void zgemm_(const char *transa,

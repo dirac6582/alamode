@@ -1,0 +1,32 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cmake",
+			"label": "CMake: install",
+			"command": "install",
+			"problemMatcher": [],
+			"detail": "CMake template install task"
+		},
+
+		// Makefileを使用する例
+		{
+			"label": "my make",
+			"type": "shell",
+			"command": "make",
+			"args": [],
+			"group": "build"
+		},
+				
+		// make cleanの例
+		{
+			"label": "my make clean",
+			"type": "shell",
+			"command": "make",
+			"args": [
+				"clean"
+			],
+			"group": "build"
+		}
+	]
+}
